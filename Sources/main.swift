@@ -163,7 +163,10 @@ private final class FeatureButton: NSButton {
     required init?(coder: NSCoder) { nil }
 
     override var state: NSControl.StateValue {
-        didSet { updateAppearance() }
+        didSet {
+            guard oldValue != state else { return }
+            updateAppearance()
+        }
     }
 
     override func updateLayer() {
@@ -329,11 +332,18 @@ private final class AccentSwitch: NSButton {
     override var intrinsicContentSize: NSSize { NSSize(width: 38, height: 22) }
 
     override var state: NSControl.StateValue {
-        didSet { updateAppearance(animated: window != nil) }
+        didSet {
+            // 面板每 250ms 刷新一次状态；值未变时不重启动画，否则会持续闪炼。
+            guard oldValue != state else { return }
+            updateAppearance(animated: window != nil)
+        }
     }
 
     override var isEnabled: Bool {
-        didSet { updateAppearance(animated: false) }
+        didSet {
+            guard oldValue != isEnabled else { return }
+            updateAppearance(animated: false)
+        }
     }
 
     override func layout() {
@@ -645,6 +655,7 @@ private final class StatusIndicator: NSObject {
     private let readingModeSwitch = FeatureButton(title: "阅读模式", symbol: "book", accentColor: .systemGreen)
     private let comboPolicySwitch = FeatureButton(title: "智能组合", symbol: "wand.and.stars", accentColor: .systemPurple)
     private let comboStatusLabel = NSTextField(labelWithString: "")
+    private let versionLabel = NSTextField(labelWithString: "")
     private let keepAwakeController = KeepAwakeController()
     private let captureBrightButton = FeatureButton(title: "明亮关灯", symbol: "sun.max.fill", accentColor: .systemOrange)
     private let captureDarkButton = FeatureButton(title: "昏暗开灯", symbol: "moon.fill", accentColor: .systemBlue)
@@ -1372,6 +1383,30 @@ private final class StatusIndicator: NSObject {
         }
         refreshControls()
         lamp.requestStatus()
+    }
+
+    @objc private func quitApplication() {
+        pendingDisplayPolicyWorkItem?.cancel()
+        pendingBuiltinWakeWorkItems.forEach { $0.cancel() }
+        pendingBuiltinWakeWorkItems.removeAll()
+        _ = displayController.setStudioEnabled(true)
+        _ = keepAwakeController.setActive(false)
+        log("用户从面板退出应用，版本 \(Self.versionText())")
+        NSApp.terminate(nil)
+    }
+
+    private static func versionText() -> String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        var stamp = "—"
+        if let url = Bundle.main.executableURL,
+           let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "MM-dd HH:mm"
+            stamp = formatter.string(from: date)
+        }
+        return "v\(short) (\(build)) · 构建 \(stamp)"
     }
 
     /// 策略引擎使用的时段色温基线（与「色温随时间」同一曲线）。
@@ -2272,9 +2307,25 @@ private final class StatusIndicator: NSObject {
         standbyLabel.textColor = .secondaryLabelColor
         standbyLabel.isHidden = isStudioDisplayAvailable
         standbyLabel.widthAnchor.constraint(equalToConstant: UIStyle.contentWidth).isActive = true
+        versionLabel.stringValue = Self.versionText()
+        versionLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
+        versionLabel.textColor = .tertiaryLabelColor
+        let quitButton = NSButton(title: "退出应用", target: self, action: #selector(quitApplication))
+        quitButton.bezelStyle = .inline
+        quitButton.controlSize = .small
+        quitButton.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
+        quitButton.imagePosition = .imageLeading
+        quitButton.font = UIStyle.controlFont
+        quitButton.toolTip = "退出 iScreen Menu；下次登录或重新运行 install.sh 才会启动"
+        let footer = NSStackView(views: [versionLabel, flexibleSpace(), quitButton])
+        footer.orientation = .horizontal
+        footer.alignment = .centerY
+        footer.spacing = 6
+        footer.widthAnchor.constraint(equalToConstant: UIStyle.contentWidth).isActive = true
+
         let stack = NSStackView(views: [header, standbyLabel, separator(), featureContainer, comboStatusLabel, separator(), adjustmentContainer,
                                        separator(), ambientContainer, separator(), presenceContainer, separator(), displayContainer,
-                                       separator(), presetContainer])
+                                       separator(), presetContainer, separator(), footer])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
@@ -2285,7 +2336,7 @@ private final class StatusIndicator: NSObject {
         }
 
         let controller = NSViewController()
-        controller.view = NSView(frame: NSRect(x: 0, y: 0, width: UIStyle.panelWidth, height: 672))
+        controller.view = NSView(frame: NSRect(x: 0, y: 0, width: UIStyle.panelWidth, height: 710))
         controller.view.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: controller.view.leadingAnchor),
@@ -2294,7 +2345,7 @@ private final class StatusIndicator: NSObject {
             stack.bottomAnchor.constraint(lessThanOrEqualTo: controller.view.bottomAnchor)
         ])
         popover.contentViewController = controller
-        popover.contentSize = NSSize(width: UIStyle.panelWidth, height: 672)
+        popover.contentSize = NSSize(width: UIStyle.panelWidth, height: 710)
         popover.behavior = .transient
     }
 
@@ -3087,7 +3138,7 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
                 log("组合策略：Mac 空闲 \(Int(idle / 60)) 分钟且未启用灯体入座检测，关闭 iScreenBar")
             }
         }
-        statusIndicator.setComboStatus("组合策略 · 未检测到在座")
+        statusIndicator.setComboStatus("组合策略 · 未检测到在座（\(presenceOn ? "灯体感应+键鼠空闲" : "键鼠 \(Int(idle / 60)) 分钟无操作")）")
         return
     }
 
@@ -3181,7 +3232,8 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
         log("组合策略：时段基线 \(baseline)K 微调 \(tweak > 0 ? "+" : "")\(tweak)K → 色温 \(appliedTemperature)K")
     }
 
-    statusIndicator.setComboStatus("组合策略 · \(macActive ? "在座" : "离座") · 亮度 \(appliedBrightness)% · 色温 \(appliedTemperature)K")
+    let occupancyText = presenceOn ? "在座·灯体感应" : (macActive ? "在座·键鼠活动" : "离座")
+    statusIndicator.setComboStatus("组合策略 · \(occupancyText) · 亮度 \(appliedBrightness)% · 色温 \(appliedTemperature)K")
 }
 
 private func pollDisplayAndLamp() {

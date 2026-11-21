@@ -32,7 +32,8 @@ escaped_log=${log_file//&/&amp;}
   print "<string>$escaped_executable/Contents/MacOS/iScreenBarStudioSync</string>"
   print '</array>'
   print '<key>RunAtLoad</key><true/>'
-  print '<key>KeepAlive</key><true/>'
+  print '<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>'
+  print '<key>ThrottleInterval</key><integer>10</integer>'
   print "<key>StandardOutPath</key><string>$escaped_log</string>"
   print "<key>StandardErrorPath</key><string>$escaped_log</string>"
   print '</dict></plist>'
