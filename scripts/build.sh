@@ -14,6 +14,7 @@ xcrun swiftc -O \
   -framework CoreGraphics \
   -framework IOKit \
   "$project_dir/Sources/main.swift" \
+  "$project_dir/Sources/PanelUI.swift" \
   -o "$executable_dir/iScreenBarStudioSync"
 
 install -m 644 "$project_dir/Info.plist" "$app_dir/Contents/Info.plist"

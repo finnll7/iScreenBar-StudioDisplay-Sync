@@ -4,6 +4,7 @@ import Darwin
 import Foundation
 import IOKit.hid
 import ObjectiveC.runtime
+import SwiftUI
 import UniformTypeIdentifiers
 
 private let benqVendorID = 0x04A5
@@ -731,6 +732,7 @@ private final class StatusIndicator: NSObject {
     private var areAmbientRulesEnabled: Bool
     private var isDisplayAutoPresetEnabled: Bool
     private var didSyncPresenceSettings = false
+    private let panelModel = PanelModel()
     private var isHealthy = true
     private var isStudioDisplayAvailable = false
     private let standbyLabel = NSTextField(labelWithString: "未检测到 Studio Display，功能待机")
@@ -815,6 +817,7 @@ private final class StatusIndicator: NSObject {
         item.button?.action = #selector(togglePanel)
         migrateDisplayPresetIfNeeded()
         configurePanel()
+        installGlassPanel()
         NotificationCenter.default.addObserver(self, selector: #selector(applicationWillTerminate),
                                                name: NSApplication.willTerminateNotification, object: nil)
         let workspaceNotifications = NSWorkspace.shared.notificationCenter
@@ -2632,6 +2635,214 @@ private final class StatusIndicator: NSObject {
         captureDarkButton.isEnabled = !standby && currentDisplayAmbientProxy != nil
         presenceDelayPopup.isEnabled = enabled
         presenceSensitivityPopup.isEnabled = enabled
+        publishPanelSnapshot()
+    }
+
+    // MARK: - SwiftUI 面板桥接
+
+    /// 用 SwiftUI + Liquid Glass 面板替换 AppKit 布局，原有控件对象保留作为状态载体。
+    private func installGlassPanel() {
+        panelModel.actions = PanelActions(
+            setPower: { [weak self] on in
+                guard let self else { return }
+                self.powerSwitch.state = on ? .on : .off
+                self.powerChanged()
+            },
+            setBrightness: { [weak self] value in
+                guard let self else { return }
+                self.brightnessSlider.doubleValue = value.rounded()
+                self.brightnessValueLabel.stringValue = "\(Int(value.rounded()))%"
+                self.brightnessChanged()
+            },
+            brightnessEditing: { [weak self] editing in
+                guard let self else { return }
+                self.isBrightnessSliderTracking = editing
+                if !editing { self.flushSliderInteraction() }
+            },
+            setTemperature: { [weak self] value in
+                guard let self else { return }
+                self.temperatureSlider.doubleValue = value
+                self.temperatureChanged()
+            },
+            temperatureEditing: { [weak self] editing in
+                guard let self else { return }
+                self.isTemperatureSliderTracking = editing
+                if !editing { self.flushSliderInteraction() }
+            },
+            setAutoLight: { [weak self] on in
+                guard let self else { return }
+                self.autoLightSwitch.state = on ? .on : .off
+                self.autoLightChanged()
+            },
+            setPresence: { [weak self] on in
+                guard let self else { return }
+                self.presenceSwitch.state = on ? .on : .off
+                self.presenceChanged()
+            },
+            setPresenceDelay: { [weak self] seconds in
+                guard let self else { return }
+                self.selectPresenceDelay(seconds)
+                self.presenceDelayChanged()
+            },
+            setPresenceSensitivity: { [weak self] value in
+                guard let self else { return }
+                self.presenceSensitivityPopup.selectItem(withTag: value)
+                self.presenceSensitivityChanged()
+            },
+            setVideoMode: { [weak self] on in
+                guard let self else { return }
+                self.videoModeSwitch.state = on ? .on : .off
+                self.videoModeChanged()
+            },
+            setBrightnessFollow: { [weak self] on in
+                guard let self else { return }
+                self.brightnessFollowSwitch.state = on ? .on : .off
+                self.brightnessFollowChanged()
+            },
+            setPowerSync: { [weak self] on in
+                guard let self else { return }
+                self.powerSyncSwitch.state = on ? .on : .off
+                self.powerSyncChanged()
+            },
+            setTimeTemperature: { [weak self] on in
+                guard let self else { return }
+                self.timeTemperatureSwitch.state = on ? .on : .off
+                self.timeTemperatureChanged()
+            },
+            setDisplayLock: { [weak self] on in
+                guard let self else { return }
+                self.displayBrightnessLockSwitch.state = on ? .on : .off
+                self.displayBrightnessLockChanged()
+            },
+            setKeepAwake: { [weak self] on in
+                guard let self else { return }
+                self.keepAwakeSwitch.state = on ? .on : .off
+                self.keepAwakeChanged()
+            },
+            setReadingMode: { [weak self] on in
+                guard let self else { return }
+                self.readingModeSwitch.state = on ? .on : .off
+                self.readingModeChanged()
+            },
+            setCombo: { [weak self] on in
+                guard let self else { return }
+                self.comboPolicySwitch.state = on ? .on : .off
+                self.comboPolicyChanged()
+            },
+            captureClose: { [weak self] in self?.captureBrightThreshold() },
+            captureOpen: { [weak self] in self?.captureDarkThreshold() },
+            commitClose: { [weak self] text in self?.commitAmbientText(text, isClose: true) },
+            commitOpen: { [weak self] text in self?.commitAmbientText(text, isClose: false) },
+            setAmbientRules: { [weak self] on in
+                guard let self else { return }
+                self.ambientEnableSwitch.state = on ? .on : .off
+                self.ambientEnableChanged()
+            },
+            setBuiltin: { [weak self] on in
+                guard let self else { return }
+                self.displayPowerSwitch.state = on ? .on : .off
+                self.displayPowerChanged()
+            },
+            rotateBuiltin: { [weak self] in self?.displayRotationChanged() },
+            setStudio: { [weak self] on in
+                guard let self else { return }
+                self.studioPowerSwitch.state = on ? .on : .off
+                self.studioPowerChanged()
+            },
+            setDisplayAutoPreset: { [weak self] on in
+                guard let self else { return }
+                self.displayAutoPresetSwitch.state = on ? .on : .off
+                self.displayAutoPresetChanged()
+            },
+            applyMode: { [weak self] index in
+                guard let self else { return }
+                let item = NSMenuItem(title: self.modeNames()[index], action: nil, keyEquivalent: "")
+                item.tag = index
+                self.presetChanged(item)
+            },
+            showModeCenter: { [weak self] in self?.showModeCenter() },
+            bindCurrentApp: { [weak self] in self?.bindCurrentModeToApp() },
+            applyRotationPreset: { [weak self] in self?.applyRotationPreset() },
+            saveRotationPreset: { [weak self] in self?.saveCurrentRotationPreset() },
+            toggleRotationAutomation: { [weak self] in self?.toggleRotationPresetAutomation() },
+            quit: { [weak self] in self?.quitApplication() }
+        )
+        let host = NSHostingController(rootView: GlassPanelView(model: panelModel))
+        host.view.frame = NSRect(x: 0, y: 0, width: 372, height: 720)
+        popover.contentViewController = host
+        popover.contentSize = NSSize(width: 372, height: 720)
+    }
+
+    /// 把 AppKit 控件上的当前状态镜像给 SwiftUI 面板。
+    private func publishPanelSnapshot() {
+        var snapshot = PanelSnapshot()
+        snapshot.standbyNote = isStudioDisplayAvailable ? nil : "未检测到 Studio Display，功能待机"
+        snapshot.lampConnected = lamp.isConnected
+        snapshot.powerOn = powerSwitch.state == .on
+        snapshot.brightness = Double(lamp.currentBrightness ?? Int(brightnessSlider.doubleValue))
+        snapshot.brightnessText = brightnessValueLabel.stringValue
+        snapshot.temperature = Double(lamp.currentTemperature ?? Int(temperatureSlider.doubleValue))
+        snapshot.temperatureText = temperatureValueLabel.stringValue
+        snapshot.autoLightOn = autoLightSwitch.state == .on
+        snapshot.autoLightTitle = autoLightSwitch.title
+        snapshot.autoLightEnabled = autoLightSwitch.isEnabled
+        snapshot.presenceOn = presenceSwitch.state == .on
+        snapshot.presenceTitle = presenceSwitch.title
+        snapshot.presenceEnabled = presenceSwitch.isEnabled
+        snapshot.videoOn = videoModeSwitch.state == .on
+        snapshot.brightnessFollowOn = brightnessFollowSwitch.state == .on
+        snapshot.brightnessFollowEnabled = brightnessFollowSwitch.isEnabled
+        snapshot.powerSyncOn = powerSyncSwitch.state == .on
+        snapshot.timeTemperatureOn = timeTemperatureSwitch.state == .on
+        snapshot.timeTemperatureEnabled = timeTemperatureSwitch.isEnabled
+        snapshot.displayLockOn = displayBrightnessLockSwitch.state == .on
+        snapshot.displayLockEnabled = displayBrightnessLockSwitch.isEnabled
+        snapshot.keepAwakeOn = keepAwakeSwitch.state == .on
+        snapshot.readingModeOn = readingModeSwitch.state == .on
+        snapshot.comboOn = comboPolicySwitch.state == .on
+        snapshot.comboStatus = comboStatusLabel.stringValue
+        snapshot.presenceDelay = presenceDelaySeconds
+        snapshot.presenceDelayOptions = presenceDelayOptions.map { seconds in
+            PresenceDelayOption(id: seconds, label: "\(seconds / 60) 分钟")
+        }
+        snapshot.presenceSensitivity = presenceSensitivity
+        snapshot.ambientCloseText = brightThresholdField.stringValue
+        snapshot.ambientOpenText = darkThresholdField.stringValue
+        snapshot.ambientStatus = ambientStatusLabel.stringValue
+        snapshot.ambientRulesOn = ambientEnableSwitch.state == .on
+        snapshot.ambientRulesEnabled = ambientEnableSwitch.isEnabled
+        snapshot.ambientFieldsEnabled = brightThresholdField.isEnabled
+        snapshot.captureEnabled = captureBrightButton.isEnabled
+        snapshot.builtinOn = displayPowerSwitch.state == .on
+        snapshot.builtinEnabled = displayPowerSwitch.isEnabled
+        snapshot.rotateTitle = displayRotateButton.title
+        snapshot.rotateEnabled = displayRotateButton.isEnabled
+        snapshot.studioOn = studioPowerSwitch.state == .on
+        snapshot.studioEnabled = studioPowerSwitch.isEnabled
+        snapshot.displayAutoPresetOn = displayAutoPresetSwitch.state == .on
+        snapshot.displayAutoPresetEnabled = displayAutoPresetSwitch.isEnabled
+        snapshot.modeTitle = modeButton.title
+        snapshot.modeItems = modeNames()
+        snapshot.rotationTitle = rotationModeButton.title
+        snapshot.bindTitle = bindAppButton.title
+        snapshot.version = appVersionText()
+        if panelModel.snapshot != snapshot {
+            panelModel.snapshot = snapshot
+        }
+    }
+
+    /// SwiftUI 输入框提交：校验后写入标定值。
+    private func commitAmbientText(_ text: String, isClose: Bool) {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard let value = Int(trimmed), value >= 0, value <= 60000 else {
+            NSSound.beep()
+            ambientStatusLabel.stringValue = "标定值需为 0–60000 的整数"
+            publishPanelSnapshot()
+            return
+        }
+        applyAmbientThreshold(value, isClose: isClose)
+        log("已手动设置环境\(isClose ? "关灯点" : "开灯点")：\(value)")
+        publishPanelSnapshot()
     }
 
     private func syncThresholdFields(force: Bool = false) {
