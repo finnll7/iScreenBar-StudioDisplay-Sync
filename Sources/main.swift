@@ -1463,7 +1463,8 @@ private final class StatusIndicator: NSObject {
                 timeTemperatureSwitch.state = .off
                 UserDefaults.standard.set(false, forKey: "timeTemperatureEnabled")
             }
-            comboManualOverrideUntil = Date().addingTimeInterval(30)
+            // 开启组合后只需短暂让位（避免与刚写入的固件状态抢写），不需要像手动调灯那样停 15 分钟。
+            comboManualOverrideUntil = Date().addingTimeInterval(3)
             log("已开启智能组合策略：入座与 Mac 活动决定开关，环境光决定亮度，时段为主决定色温")
         } else {
             // 引擎因环境过亮关灯时会暂停固件入座检测与自动感光，关闭组合时必须释放，否则会一直卡在暂停。
@@ -3293,15 +3294,16 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     let ratio = min(1, max(0, (Double(ambient) - mapDark) / (mapBright - mapDark)))
     let mapped = Double(brightnessCeiling) - Double(brightnessCeiling - brightnessFloor) * ratio
 
-    // 从“目标值”起步而非灯体回读值，避免重启或开关后因回读跳变导致亮度一下暗一下亮。
-    let previous = comboPolicyState.smoothedBrightness ?? mapped
-    // 单次最多变化 6%，再乘 0.5 系数，避免环境光跳变时亮度阶梯突变造成“闪烁”。
-    let slewed = previous + max(-6, min(6, (mapped - previous) * 0.5))
+    // 首次从灯体当前亮度起步，让接管过程是渐变而不是一下子跳过去。
+    let previous = comboPolicyState.smoothedBrightness
+        ?? Double(lamp.currentBrightness ?? Int(mapped.rounded()))
+    // 单次最多变化 10%，再乘 0.5 系数，避免环境光跳变时亮度阶跃。
+    let slewed = previous + max(-10, min(10, (mapped - previous) * 0.5))
     comboPolicyState.smoothedBrightness = slewed
     let appliedBrightness = max(1, min(100, Int(slewed.rounded())))
     let currentBrightness = lamp.currentBrightness ?? appliedBrightness
     if abs(appliedBrightness - currentBrightness) >= 3,
-       now.timeIntervalSince(comboPolicyState.lastBrightnessWriteAt) >= 6,
+       now.timeIntervalSince(comboPolicyState.lastBrightnessWriteAt) >= 4,
        lamp.setBrightness(appliedBrightness) {
         comboPolicyState.lastBrightness = appliedBrightness
         comboPolicyState.lastBrightnessWriteAt = now
@@ -3316,7 +3318,7 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     let temperatureStep = max(-250, min(250, mappedTemperature - currentTemperature))
     let appliedTemperature = max(2700, min(6500, currentTemperature + temperatureStep))
     if abs(appliedTemperature - currentTemperature) >= 100,
-       now.timeIntervalSince(comboPolicyState.lastTemperatureWriteAt) >= 60,
+       now.timeIntervalSince(comboPolicyState.lastTemperatureWriteAt) >= 30,
        lamp.setTemperature(appliedTemperature) {
         comboPolicyState.lastTemperature = appliedTemperature
         comboPolicyState.lastTemperatureWriteAt = now
