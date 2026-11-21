@@ -3101,6 +3101,8 @@ if let displayID {
 var wasAsleep = displayID.map { CGDisplayIsAsleep($0) != 0 } ?? false
 var wasConsoleSessionLocked = isConsoleSessionLocked()
 var helperTurnedLampOff = false
+/// 入座唤醒显示器的限速时间戳，避免固件反复点亮时不断发唤醒。
+var lastPresenceWakeAt = Date.distantPast
 var ambientTurnedLampOff = UserDefaults.standard.bool(forKey: "ambientLampLockActive")
 var ambientCloseCandidateSince: Date?
 var ambientOpenCandidateSince: Date?
@@ -3398,6 +3400,8 @@ private func pollDisplayAndLamp() {
     let brightnessFollowEnabled = statusIndicator.isBrightnessFollowEnabled
     let displayBrightnessLockEnabled = statusIndicator.isDisplayBrightnessLockEnabled
     let powerSyncEnabled = statusIndicator.isPowerSyncEnabled
+    // 熄屏时是否保留入座检测、允许“入座→唤醒屏幕”（默认开，可用 presenceWakesDisplay=0 关闭）。
+    let presenceWakesDisplay = comboSetting("presenceWakesDisplay", 1) == 1
     let ambientLinkEnabled = statusIndicator.isAmbientLinkEnabled
     let comboEnabled = statusIndicator.isComboPolicyEnabled
     let ambientCloseThreshold = statusIndicator.ambientCloseThreshold
@@ -3435,14 +3439,24 @@ private func pollDisplayAndLamp() {
     // 熄屏同步是最高优先级：屏幕熄灭期间，环境光、入座检测或灯体自身逻辑
     // 都不得重新点亮灯。持续检测可覆盖灯体在熄屏后中途自行亮起的情况。
     if powerSyncEnabled, isAsleep {
-        statusIndicator.suspendPresenceForScreenSleep()
-        if lamp.isPowerOn == true {
-            let turnedOff = lamp.setPower(on: false)
-            helperTurnedLampOff = helperTurnedLampOff || turnedOff
-            if turnedOff {
-                log("熄屏同步优先级已压制灯体自动重新点亮")
+        if presenceWakesDisplay, lamp.isPresenceDetectionEnabled == true {
+            // 保留入座检测：固件因“有人坐下”把灯点亮时，视为人回来了，直接唤醒屏幕并保留灯光。
+            if lamp.isPowerOn == true, Date().timeIntervalSince(lastPresenceWakeAt) > 30 {
+                lastPresenceWakeAt = Date()
+                helperTurnedLampOff = false
+                let woke = requestSystemDisplayWake()
+                log(woke ? "检测到入座：灯体已点亮，已唤醒显示器" : "检测到入座：但唤醒显示器请求失败")
             }
-            statusIndicator.update(isAsleep: true, healthy: turnedOff)
+        } else {
+            statusIndicator.suspendPresenceForScreenSleep()
+            if lamp.isPowerOn == true {
+                let turnedOff = lamp.setPower(on: false)
+                helperTurnedLampOff = helperTurnedLampOff || turnedOff
+                if turnedOff {
+                    log("熄屏同步优先级已压制灯体自动重新点亮")
+                }
+                statusIndicator.update(isAsleep: true, healthy: turnedOff)
+            }
         }
     }
 
@@ -3607,9 +3621,15 @@ private func pollDisplayAndLamp() {
         if isAsleep {
             log("检测到 Studio Display 熄屏")
             if powerSyncEnabled {
-                statusIndicator.suspendPresenceForScreenSleep()
-                helperTurnedLampOff = lamp.setPower(on: false)
-                statusIndicator.update(isAsleep: true, healthy: helperTurnedLampOff)
+                if presenceWakesDisplay, lamp.isPresenceDetectionEnabled == true {
+                    log("熄屏同步：保留入座检测，以便入座时唤醒显示器")
+                    helperTurnedLampOff = lamp.setPower(on: false)
+                    statusIndicator.update(isAsleep: true, healthy: helperTurnedLampOff)
+                } else {
+                    statusIndicator.suspendPresenceForScreenSleep()
+                    helperTurnedLampOff = lamp.setPower(on: false)
+                    statusIndicator.update(isAsleep: true, healthy: helperTurnedLampOff)
+                }
             } else {
                 statusIndicator.update(isAsleep: true, healthy: true)
             }
