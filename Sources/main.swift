@@ -3220,18 +3220,20 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     }
 
     // 1) 入座优先：无人在座时不做任何环境动作，只按需要关灯。
-    //    灯体入座检测开着时，“灯亮”或“近期有输入”均视为在座（固件负责离座关灯）。
-    let present = presenceOn ? (lamp.isPowerOn == true || recentActivity) : macActive
+    //    Mac 空闲达到阈值（默认 10 分钟）即强制判离座——即便灯体入座检测仍认为有人，
+    //    否则固件一旦判错，灯就会一直亮着。未达阈值时由“近期输入”或固件灯态决定。
+    let macIdleOverLimit = idle >= TimeInterval(comboSetting("comboIdleSeconds", 600))
+    let present = !macIdleOverLimit && (recentActivity || !presenceOn || lamp.isPowerOn == true)
     if !present {
-        if powerWriteAllowed, !presenceOn, !ambientTurnedLampOff, lamp.isPowerOn == true,
+        if powerWriteAllowed, !ambientTurnedLampOff, lamp.isPowerOn == true,
            now.timeIntervalSince(comboPolicyState.lastEnginePowerOffAt) > 120 {
             if lamp.setPower(on: false) {
                 comboPolicyState.lastEnginePowerOffAt = now
                 comboPolicyState.lastPowerWriteAt = now
-                log("组合策略：Mac 空闲 \(Int(idle / 60)) 分钟且未启用灯体入座检测，关闭 iScreenBar")
+                log("组合策略：Mac 已空闲 \(Int(idle / 60)) 分钟，判为离座，已关闭 iScreenBar（灯体入座检测=\(presenceOn ? "开" : "关")）")
             }
         }
-        statusIndicator.setComboStatus("组合策略 · 未检测到在座（\(presenceOn ? "灯体感应+键鼠空闲" : "键鼠 \(Int(idle / 60)) 分钟无操作")）")
+        statusIndicator.setComboStatus("组合策略 · Mac 空闲 \(Int(idle / 60)) 分钟，判为离座")
         return
     }
 

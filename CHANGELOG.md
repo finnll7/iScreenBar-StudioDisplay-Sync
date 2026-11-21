@@ -4,6 +4,12 @@
 版本号写在 `Info.plist` 的 `CFBundleShortVersionString` / `CFBundleVersion`，面板底部会显示。
 每次发版：更新本文件 → 改 `Info.plist` → `./scripts/install.sh` → 面板核对版本与构建时间。
 
+## 0.3.7 (build 10) — 2026-11-21
+
+修复
+
+- 离开后灯不关：原先“灯亮”本身被当作在座证据，一旦灯体入座检测判错，就永远认为人还在。现在 Mac 空闲达到 `comboIdleSeconds`（默认 600 秒）即强制判离座并关灯，不再依赖固件。
+
 ## 0.3.6 (build 9) — 2026-11-21
 
 调整
