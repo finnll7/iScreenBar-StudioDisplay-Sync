@@ -162,7 +162,7 @@ struct GlassPanelView: View {
                 presenceSettings
                 displaySection
                 presets
-                footer
+                systemSection
             }
             .padding(16)
         }
@@ -184,7 +184,7 @@ struct GlassPanelView: View {
     private var quickControls: some View {
         VStack(alignment: .leading, spacing: 8) {
             sectionTitle("快捷控制")
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 2), spacing: 8) {
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) {
                 toggle("灯光", "power", snapshot.powerOn, snapshot.lampConnected, actions.setPower)
                 toggle(snapshot.autoLightTitle, "sun.max", snapshot.autoLightOn, snapshot.autoLightEnabled, actions.setAutoLight)
                 toggle(snapshot.presenceTitle, "figure.seated.side", snapshot.presenceOn, snapshot.presenceEnabled, actions.setPresence)
@@ -193,7 +193,6 @@ struct GlassPanelView: View {
                 toggle("熄屏同步", "moon.zzz", snapshot.powerSyncOn, snapshot.lampConnected, actions.setPowerSync)
                 toggle("自动色温", "circle.lefthalf.filled", snapshot.timeTemperatureOn, snapshot.timeTemperatureEnabled, actions.setTimeTemperature)
                 toggle("双屏亮度", "rectangle.on.rectangle", snapshot.displayLockOn, snapshot.displayLockEnabled, actions.setDisplayLock)
-                toggle("防止休眠", "cup.and.saucer", snapshot.keepAwakeOn, true, actions.setKeepAwake)
                 toggle("阅读模式", "book", snapshot.readingModeOn, snapshot.lampConnected, actions.setReadingMode)
                 toggle("智能组合", "wand.and.stars", snapshot.comboOn, snapshot.lampConnected, actions.setCombo)
             }
@@ -237,27 +236,47 @@ struct GlassPanelView: View {
 
     private var ambient: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
+            HStack(spacing: 8) {
                 sectionTitle("环境光标定")
                 Spacer()
-                Text("启用").font(.system(size: 11)).foregroundStyle(.secondary)
+                Text("启用")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
                 Toggle("", isOn: Binding(get: { snapshot.ambientRulesOn }, set: { actions.setAmbientRules($0) }))
                     .labelsHidden()
                     .toggleStyle(.switch)
                     .controlSize(.mini)
                     .disabled(!snapshot.ambientRulesEnabled)
             }
-            HStack(spacing: 8) {
-                TextField("明亮关灯", text: $closeText)
-                    .textFieldStyle(.roundedBorder)
-                    .multilineTextAlignment(.center)
-                    .disabled(!snapshot.ambientFieldsEnabled)
-                    .onSubmit { actions.commitClose(closeText) }
-                TextField("昏暗开灯", text: $openText)
-                    .textFieldStyle(.roundedBorder)
-                    .multilineTextAlignment(.center)
-                    .disabled(!snapshot.ambientFieldsEnabled)
-                    .onSubmit { actions.commitOpen(openText) }
+            Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 8) {
+                GridRow {
+                    Text("明亮关灯")
+                        .font(.system(size: 11.5))
+                        .frame(width: 62, alignment: .leading)
+                    TextField("--", text: $closeText)
+                        .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.center)
+                        .disabled(!snapshot.ambientFieldsEnabled)
+                        .onSubmit { actions.commitClose(closeText) }
+                    Button("采集") { actions.captureClose() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(!snapshot.captureEnabled)
+                }
+                GridRow {
+                    Text("昏暗开灯")
+                        .font(.system(size: 11.5))
+                        .frame(width: 62, alignment: .leading)
+                    TextField("--", text: $openText)
+                        .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.center)
+                        .disabled(!snapshot.ambientFieldsEnabled)
+                        .onSubmit { actions.commitOpen(openText) }
+                    Button("采集") { actions.captureOpen() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(!snapshot.captureEnabled)
+                }
             }
             .onAppear {
                 closeText = snapshot.ambientCloseText
@@ -265,19 +284,10 @@ struct GlassPanelView: View {
             }
             .onChange(of: snapshot.ambientCloseText) { _, newValue in closeText = newValue }
             .onChange(of: snapshot.ambientOpenText) { _, newValue in openText = newValue }
-            HStack(spacing: 8) {
-                Button("采集明亮") { actions.captureClose() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(!snapshot.captureEnabled)
-                Button("采集昏暗") { actions.captureOpen() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(!snapshot.captureEnabled)
-            }
             Text(snapshot.ambientStatus)
                 .font(.system(size: 10.5).monospacedDigit())
                 .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .lineLimit(2)
         }
         .padding(14)
@@ -286,11 +296,10 @@ struct GlassPanelView: View {
     }
 
     private var presenceSettings: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             sectionTitle("入座检测设置")
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("离席时间").font(.system(size: 11)).foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                pickerCell("离席时间") {
                     Picker("", selection: Binding(get: { snapshot.presenceDelay }, set: { actions.setPresenceDelay($0) })) {
                         ForEach(snapshot.presenceDelayOptions) { option in
                             Text(option.label).tag(option.id)
@@ -300,8 +309,7 @@ struct GlassPanelView: View {
                     .pickerStyle(.menu)
                     .controlSize(.small)
                 }
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("灵敏度").font(.system(size: 11)).foregroundStyle(.secondary)
+                pickerCell("灵敏度") {
                     Picker("", selection: Binding(get: { snapshot.presenceSensitivity }, set: { actions.setPresenceSensitivity($0) })) {
                         Text("低").tag(0)
                         Text("中").tag(1)
@@ -311,7 +319,6 @@ struct GlassPanelView: View {
                     .pickerStyle(.menu)
                     .controlSize(.small)
                 }
-                Spacer()
             }
         }
         .padding(14)
@@ -322,18 +329,25 @@ struct GlassPanelView: View {
     private var displaySection: some View {
         VStack(alignment: .leading, spacing: 8) {
             sectionTitle("显示屏与旋转")
-            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) {
-                toggle("内屏", "display", snapshot.builtinOn, snapshot.builtinEnabled, actions.setBuiltin)
-                toggle("Studio Display", "display.2", snapshot.studioOn, snapshot.studioEnabled, actions.setStudio)
-                Button {
-                    actions.rotateBuiltin()
-                } label: {
-                    Label(snapshot.rotateTitle, systemImage: "arrow.clockwise")
-                        .frame(maxWidth: .infinity)
+            Grid(horizontalSpacing: 8, verticalSpacing: 8) {
+                GridRow {
+                    toggleCell("内屏", "display", snapshot.builtinOn, snapshot.builtinEnabled, actions.setBuiltin)
+                    toggleCell("Studio Display", "display.2", snapshot.studioOn, snapshot.studioEnabled, actions.setStudio)
                 }
-                .controlSize(.small)
-                .disabled(!snapshot.rotateEnabled)
-                toggle("自动预设", "arrow.triangle.2.circlepath", snapshot.displayAutoPresetOn, snapshot.displayAutoPresetEnabled, actions.setDisplayAutoPreset)
+                GridRow {
+                    Button {
+                        actions.rotateBuiltin()
+                    } label: {
+                        Label(snapshot.rotateTitle, systemImage: "arrow.clockwise")
+                            .font(.system(size: 11.5))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!snapshot.rotateEnabled)
+                    .frame(maxWidth: .infinity)
+                    toggleCell("自动预设", "arrow.triangle.2.circlepath", snapshot.displayAutoPresetOn, snapshot.displayAutoPresetEnabled, actions.setDisplayAutoPreset)
+                }
             }
         }
         .padding(14)
@@ -362,6 +376,7 @@ struct GlassPanelView: View {
                     actions.bindCurrentApp()
                 } label: {
                     Label(snapshot.bindTitle, systemImage: "app.badge")
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -380,6 +395,8 @@ struct GlassPanelView: View {
                 }
                 .menuStyle(.borderlessButton)
                 .controlSize(.small)
+                .frame(maxWidth: .infinity)
+                toggleCell("防止休眠", "cup.and.saucer", snapshot.keepAwakeOn, true, actions.setKeepAwake)
             }
         }
         .padding(14)
@@ -387,8 +404,8 @@ struct GlassPanelView: View {
         .glassCard()
     }
 
-    private var footer: some View {
-        HStack {
+    private var systemSection: some View {
+        HStack(spacing: 8) {
             Text(snapshot.version)
                 .font(.system(size: 10.5).monospacedDigit())
                 .foregroundStyle(.tertiary)
@@ -402,10 +419,24 @@ struct GlassPanelView: View {
             .buttonStyle(.borderless)
             .controlSize(.small)
         }
-        .padding(.top, 2)
+        .padding(.horizontal, 4)
     }
 
-    // MARK: 组件
+    private func pickerCell<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            content()
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func toggleCell(_ title: String, _ symbol: String, _ isOn: Bool, _ enabled: Bool, _ action: @escaping (Bool) -> Void) -> some View {
+        toggle(title, symbol, isOn, enabled, action)
+            .frame(maxWidth: .infinity)
+    }
 
     private func sectionTitle(_ text: String) -> some View {
         Text(text)
