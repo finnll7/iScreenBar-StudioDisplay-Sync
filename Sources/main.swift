@@ -643,6 +643,8 @@ private final class StatusIndicator: NSObject {
     private let powerSyncSwitch = FeatureButton(title: "熄屏同步", symbol: "moon.zzz", accentColor: activeControlColor)
     private let keepAwakeSwitch = FeatureButton(title: "防止休眠", symbol: "cup.and.saucer", accentColor: activeControlColor)
     private let readingModeSwitch = FeatureButton(title: "阅读模式", symbol: "book", accentColor: .systemGreen)
+    private let comboPolicySwitch = FeatureButton(title: "智能组合", symbol: "wand.and.stars", accentColor: .systemPurple)
+    private let comboStatusLabel = NSTextField(labelWithString: "")
     private let keepAwakeController = KeepAwakeController()
     private let captureBrightButton = FeatureButton(title: "明亮关灯", symbol: "sun.max.fill", accentColor: .systemOrange)
     private let captureDarkButton = FeatureButton(title: "昏暗开灯", symbol: "moon.fill", accentColor: .systemBlue)
@@ -664,6 +666,9 @@ private final class StatusIndicator: NSObject {
     private(set) var isPowerSyncEnabled: Bool
     private(set) var isTimeTemperatureEnabled: Bool
     private(set) var isReadingModeEnabled: Bool
+    private(set) var isComboPolicyEnabled: Bool
+    /// 手动调过灯后的一段时间内，策略引擎不覆写用户设置。
+    var comboManualOverrideUntil = Date.distantPast
     private(set) var ambientCloseThreshold: Int?
     private(set) var ambientOpenThreshold: Int?
     private(set) var currentDisplayAmbientProxy: Int?
@@ -706,11 +711,17 @@ private final class StatusIndicator: NSObject {
         isPowerSyncEnabled = UserDefaults.standard.object(forKey: "powerSyncEnabled") as? Bool ?? true
         isTimeTemperatureEnabled = UserDefaults.standard.bool(forKey: "timeTemperatureEnabled")
         isReadingModeEnabled = UserDefaults.standard.bool(forKey: "readingModeEnabled")
+        isComboPolicyEnabled = UserDefaults.standard.bool(forKey: "comboPolicyEnabled")
         ambientCloseThreshold = UserDefaults.standard.object(forKey: "ambientCloseThreshold") as? Int
         ambientOpenThreshold = UserDefaults.standard.object(forKey: "ambientOpenThreshold") as? Int
         ambientThresholdSource = UserDefaults.standard.string(forKey: "ambientThresholdSource")
         areAmbientRulesEnabled = UserDefaults.standard.object(forKey: "ambientRulesEnabled") as? Bool
             ?? (ambientCloseThreshold != nil || ambientOpenThreshold != nil)
+        // 组合模式下旧环境光规则由策略引擎接管，避免两套逻辑同时写电源。
+        if isComboPolicyEnabled, areAmbientRulesEnabled {
+            areAmbientRulesEnabled = false
+            UserDefaults.standard.set(false, forKey: "ambientRulesEnabled")
+        }
         UserDefaults.standard.removeObject(forKey: "ambientLinkEnabled")
         if ambientThresholdSource != "studioDisplayALS-v1" {
             ambientCloseThreshold = nil
@@ -808,6 +819,7 @@ private final class StatusIndicator: NSObject {
 
     @objc private func powerChanged() {
         let requested = powerSwitch.state == .on
+        markManualOverride(seconds: 1800)
         if !lamp.setPower(on: requested) { powerSwitch.state = requested ? .off : .on }
         updateIcon(healthy: isHealthy && lamp.isConnected)
         lamp.requestStatus()
@@ -1057,10 +1069,12 @@ private final class StatusIndicator: NSObject {
         captureBrightButton.state = .off
         captureDarkButton.state = .off
         ambientEnableSwitch.state = areAmbientRulesEnabled ? .on : .off
-        ambientEnableSwitch.isEnabled = currentDisplayAmbientProxy != nil &&
+        ambientEnableSwitch.isEnabled = !isComboPolicyEnabled && currentDisplayAmbientProxy != nil &&
             (ambientCloseThreshold != nil || ambientOpenThreshold != nil)
         let currentText = currentDisplayAmbientProxy.map { "当前环境 \($0)" } ?? "当前环境 --"
-        if let close = ambientCloseThreshold, let open = ambientOpenThreshold, open >= close {
+        if isComboPolicyEnabled {
+            ambientStatusLabel.stringValue = "\(currentText)  ·  组合模式用作亮度映射区间"
+        } else if let close = ambientCloseThreshold, let open = ambientOpenThreshold, open >= close {
             ambientStatusLabel.stringValue = "\(currentText)  ·  阈值重叠，可能反复开关"
         } else if !areAmbientRulesEnabled, ambientCloseThreshold != nil || ambientOpenThreshold != nil {
             ambientStatusLabel.stringValue = "\(currentText)  ·  已保存，未启用"
@@ -1076,6 +1090,7 @@ private final class StatusIndicator: NSObject {
     @objc private func brightnessChanged() {
         let value = Int(brightnessSlider.doubleValue.rounded())
         brightnessValueLabel.stringValue = "\(value)%"
+        markManualOverride()
         _ = lamp.setBrightness(value)
         lamp.requestStatus()
     }
@@ -1084,6 +1099,7 @@ private final class StatusIndicator: NSObject {
         let value = Int((temperatureSlider.doubleValue / 100).rounded()) * 100
         temperatureSlider.doubleValue = Double(value)
         temperatureValueLabel.stringValue = "\(value)K"
+        markManualOverride()
         _ = lamp.setTemperature(value)
         lamp.requestStatus()
     }
@@ -1204,6 +1220,7 @@ private final class StatusIndicator: NSObject {
     }
 
     @objc private func readingModeChanged() {
+        markManualOverride()
         if readingModeSwitch.state == .on {
             enterReadingMode()
         } else {
@@ -1310,7 +1327,59 @@ private final class StatusIndicator: NSObject {
         lamp.requestStatus()
     }
 
+    @objc private func comboPolicyChanged() {
+        let requested = comboPolicySwitch.state == .on
+        isComboPolicyEnabled = requested
+        UserDefaults.standard.set(requested, forKey: "comboPolicyEnabled")
+        if requested {
+            // 旧环境光规则的开关灯职责由引擎接管，避免两套逻辑同时写电源；标定值继续作为亮度映射区间。
+            if areAmbientRulesEnabled {
+                areAmbientRulesEnabled = false
+                UserDefaults.standard.set(false, forKey: "ambientRulesEnabled")
+            }
+            if ambientTurnedLampOff {
+                setAmbientLampLock(false)
+                restorePresenceAfterAmbientLock()
+            }
+            updateAmbientStatusLabel()
+            // 策略引擎需要独占亮度与色温：关掉固件自动感光、亮度跟随与色温随时间。
+            if lamp.isAutoLightEnabled == true { _ = lamp.setAutoLight(enabled: false) }
+            autoLightSwitch.state = .off
+            if isBrightnessFollowEnabled {
+                isBrightnessFollowEnabled = false
+                brightnessFollowSwitch.state = .off
+                UserDefaults.standard.set(false, forKey: "brightnessFollowEnabled")
+            }
+            if isTimeTemperatureEnabled {
+                isTimeTemperatureEnabled = false
+                timeTemperatureSwitch.state = .off
+                UserDefaults.standard.set(false, forKey: "timeTemperatureEnabled")
+            }
+            comboManualOverrideUntil = Date().addingTimeInterval(30)
+            log("已开启智能组合策略：入座与 Mac 活动决定开关，环境光决定亮度，时段为主决定色温")
+        } else {
+            log("已关闭智能组合策略，恢复各功能独立工作")
+        }
+        refreshControls()
+        lamp.requestStatus()
+    }
+
+    /// 策略引擎使用的时段色温基线（与「色温随时间」同一曲线）。
+    func baselineTemperature(at date: Date) -> Int {
+        return scheduledTemperature(at: date)
+    }
+
+    func setComboStatus(_ text: String) {
+        guard comboStatusLabel.stringValue != text else { return }
+        comboStatusLabel.stringValue = text
+    }
+
+    func markManualOverride(seconds: TimeInterval = 900) {
+        comboManualOverrideUntil = Date().addingTimeInterval(seconds)
+    }
+
     @objc private func presetChanged(_ sender: NSMenuItem) {
+        markManualOverride()
         let index = sender.tag
         let preset: (brightness: Int, temperature: Int, video: Bool)
         if (index == 0 || index >= 3),
@@ -1990,6 +2059,13 @@ private final class StatusIndicator: NSObject {
         readingModeSwitch.target = self
         readingModeSwitch.action = #selector(readingModeChanged)
         readingModeSwitch.toolTip = "一键应用护眼组合：亮度 70%、色温 4200K、关闭视频模式；关闭时恢复进入前的灯态"
+        comboPolicySwitch.target = self
+        comboPolicySwitch.action = #selector(comboPolicyChanged)
+        comboPolicySwitch.toolTip = "组合策略：入座/离座与 Mac 活动决定开关，环境光决定亮度，时段为主决定色温；开启后自动关闭自动感光、亮度跟随与色温随时间"
+        comboStatusLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
+        comboStatusLabel.textColor = .secondaryLabelColor
+        comboStatusLabel.isHidden = !isComboPolicyEnabled
+        comboStatusLabel.widthAnchor.constraint(equalToConstant: UIStyle.contentWidth).isActive = true
         modeButton.image = NSImage(systemSymbolName: "chevron.up.chevron.down", accessibilityDescription: nil)
         modeButton.imagePosition = .imageTrailing
         modeButton.alignment = .left
@@ -2082,12 +2158,12 @@ private final class StatusIndicator: NSObject {
             [powerSwitch, autoLightSwitch, presenceSwitch],
             [videoModeSwitch, brightnessFollowSwitch, powerSyncSwitch],
             [timeTemperatureSwitch, displayBrightnessLockSwitch, keepAwakeSwitch],
-            [readingModeSwitch, NSView(), NSView()]
+            [readingModeSwitch, comboPolicySwitch, NSView()]
         ])
         featureGrid.rowSpacing = 6
         featureGrid.columnSpacing = 6
         featureGrid.xPlacement = .fill
-        for button in [powerSwitch, autoLightSwitch, presenceSwitch, videoModeSwitch, brightnessFollowSwitch, powerSyncSwitch, timeTemperatureSwitch, displayBrightnessLockSwitch, keepAwakeSwitch, readingModeSwitch] {
+        for button in [powerSwitch, autoLightSwitch, presenceSwitch, videoModeSwitch, brightnessFollowSwitch, powerSyncSwitch, timeTemperatureSwitch, displayBrightnessLockSwitch, keepAwakeSwitch, readingModeSwitch, comboPolicySwitch] {
             button.widthAnchor.constraint(equalToConstant: 100).isActive = true
             button.heightAnchor.constraint(equalToConstant: 40).isActive = true
         }
@@ -2182,7 +2258,7 @@ private final class StatusIndicator: NSObject {
         standbyLabel.textColor = .secondaryLabelColor
         standbyLabel.isHidden = isStudioDisplayAvailable
         standbyLabel.widthAnchor.constraint(equalToConstant: UIStyle.contentWidth).isActive = true
-        let stack = NSStackView(views: [header, standbyLabel, separator(), featureContainer, separator(), adjustmentContainer,
+        let stack = NSStackView(views: [header, standbyLabel, separator(), featureContainer, comboStatusLabel, separator(), adjustmentContainer,
                                        separator(), ambientContainer, separator(), presenceContainer, separator(), displayContainer,
                                        separator(), presetContainer])
         stack.orientation = .vertical
@@ -2325,13 +2401,15 @@ private final class StatusIndicator: NSObject {
         }
         videoModeSwitch.state = lamp.isVideoModeEnabled == true ? .on : .off
         brightnessFollowSwitch.state = isBrightnessFollowEnabled ? .on : .off
-        brightnessFollowSwitch.isEnabled = !standby && lamp.isConnected
+        brightnessFollowSwitch.isEnabled = !standby && lamp.isConnected && !isComboPolicyEnabled
         displayBrightnessLockSwitch.state = isDisplayBrightnessLockEnabled ? .on : .off
         displayBrightnessLockSwitch.isEnabled = displayControlsAllowed && studioDisplayID() != nil && activeBuiltinDisplayID() != nil
         powerSyncSwitch.state = isPowerSyncEnabled ? .on : .off
         keepAwakeSwitch.state = keepAwakeController.isActive ? .on : .off
         timeTemperatureSwitch.state = isTimeTemperatureEnabled ? .on : .off
         readingModeSwitch.state = isReadingModeEnabled ? .on : .off
+        comboPolicySwitch.state = isComboPolicyEnabled ? .on : .off
+        comboStatusLabel.isHidden = !isComboPolicyEnabled
         updateAmbientStatusLabel()
         if let builtin = displayController.builtinDisplay() {
             let online = CGDisplayIsOnline(builtin) != 0
@@ -2367,13 +2445,14 @@ private final class StatusIndicator: NSObject {
         darkThresholdField.isEnabled = !standby
         ambientEnableSwitch.isEnabled = !standby && currentDisplayAmbientProxy != nil
         powerSwitch.isEnabled = enabled
-        autoLightSwitch.isEnabled = enabled && !isAmbientPresenceLockActive
+        autoLightSwitch.isEnabled = enabled && !isAmbientPresenceLockActive && !isComboPolicyEnabled
         brightnessSlider.isEnabled = enabled
         temperatureSlider.isEnabled = enabled && !isTimeTemperatureEnabled
-        timeTemperatureSwitch.isEnabled = enabled
+        timeTemperatureSwitch.isEnabled = enabled && !isComboPolicyEnabled
         presenceSwitch.isEnabled = enabled && !isAmbientPresenceLockActive && !isScreenSleepPresenceLockActive
         videoModeSwitch.isEnabled = enabled
         readingModeSwitch.isEnabled = enabled
+        comboPolicySwitch.isEnabled = enabled
         powerSyncSwitch.isEnabled = enabled
         captureBrightButton.isEnabled = !standby && currentDisplayAmbientProxy != nil
         captureDarkButton.isEnabled = !standby && currentDisplayAmbientProxy != nil
@@ -2864,6 +2943,7 @@ private func setAmbientLampLock(_ active: Bool) {
     }
 }
 private let statusIndicator = StatusIndicator(isAsleep: wasAsleep, lamp: lamp)
+log("策略状态：智能组合=\(statusIndicator.isComboPolicyEnabled ? "开" : "关")，环境规则=\(statusIndicator.isAmbientLinkEnabled ? "开" : "关")，标定=关灯\(statusIndicator.ambientCloseThreshold.map(String.init) ?? "无")/开灯\(statusIndicator.ambientOpenThreshold.map(String.init) ?? "无")")
 statusIndicator.handleStudioDisplayConnection(connected: displayID != nil)
 if !wasAsleep {
     statusIndicator.restorePresenceAfterScreenWake()
@@ -2892,6 +2972,205 @@ if wasBrightnessFollowEnabled {
     anchorStatusRevision = lamp.statusRevision
     lamp.requestStatus()
     log("Studio Display 亮度跟随已开启，正在锁定当前亮度差")
+}
+
+private struct ComboPolicyState {
+    var lastBrightness: Int?
+    var lastTemperature: Int?
+    var lastBrightnessWriteAt = Date.distantPast
+    var lastTemperatureWriteAt = Date.distantPast
+    var lastEnginePowerOffAt = Date.distantPast
+    var lastPowerWriteAt = Date.distantPast
+    var didWarnThresholdOverlap = false
+    var lastLoggedIdle: TimeInterval = -9999
+    /// 平滑后的目标亮度，避免环境光跳变时亮度阶梯突变造成“闪烁”。
+    var smoothedBrightness: Double?
+    var ambientBrightSince: Date?
+    var ambientDarkSince: Date?
+}
+
+private var comboPolicyState = ComboPolicyState()
+
+/// Mac 侧空闲秒数（任意键鼠与触控板事件）。
+private func systemIdleSeconds() -> TimeInterval {
+    guard let anyEvent = CGEventType(rawValue: UInt32.max) else { return 0 }
+    return CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyEvent)
+}
+
+private func comboSetting(_ key: String, _ fallback: Int) -> Int {
+    return UserDefaults.standard.object(forKey: key) as? Int ?? fallback
+}
+
+/// 组合策略：入座/离座决定开关，环境光映射亮度，时段为主 + 环境微调决定色温。
+/// 只在「智能组合」开启时接管；熄屏同步与待机仍在其之前生效。
+private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
+    guard statusIndicator.isComboPolicyEnabled else { return }
+    guard displayID != nil, !isAsleep else {
+        statusIndicator.setComboStatus("组合策略 · 显示器未就绪")
+        return
+    }
+    if Date() < statusIndicator.comboManualOverrideUntil {
+        statusIndicator.setComboStatus("组合策略 · 手动设置保护中，暂不覆写")
+        return
+    }
+
+    let closeThreshold = statusIndicator.ambientCloseThreshold
+    let openThreshold = statusIndicator.ambientOpenThreshold
+    let ambient = displayAmbientProxy
+    let rawIdle = systemIdleSeconds()
+    // 系统在部分上下文会返回 NaN/负值；无效值按“刚有活动”处理，避免整条策略静默失效。
+    let idle = rawIdle.isFinite && rawIdle >= 0 ? rawIdle : 0
+    let macActive = idle < TimeInterval(comboSetting("comboIdleSeconds", 600))
+    let presenceOn = lamp.isPresenceDetectionEnabled == true
+    let now = Date()
+    // 等待首次状态回读，避免启动瞬间因电源状态未知而多写一次。
+    guard lamp.isPowerOn != nil else {
+        statusIndicator.setComboStatus("组合策略 · 等待灯体状态")
+        return
+    }
+    // 任何方向的电源写入都留 45 秒冷却，避免门限重叠或状态竞态时反复开关。
+    let powerWriteAllowed = now.timeIntervalSince(comboPolicyState.lastPowerWriteAt) >= 45
+    // 开灯点不低于关灯点时两个门限会同时成立，直接停用环境门限，只保留亮度映射。
+    let ambientGateValid: Bool
+    if let closeThreshold, let openThreshold {
+        ambientGateValid = openThreshold < closeThreshold
+    } else {
+        ambientGateValid = true
+    }
+    if !ambientGateValid, !comboPolicyState.didWarnThresholdOverlap {
+        comboPolicyState.didWarnThresholdOverlap = true
+        log("组合策略：昏暗开灯点不低于明亮关灯点，环境门限已忽略，仅按亮度映射工作")
+    }
+
+    // 灯体自动感光会持续覆写亮度，与策略引擎冲突，发现即关闭。
+    if lamp.isAutoLightEnabled == true {
+        _ = lamp.setAutoLight(enabled: false)
+        log("组合策略：已关闭灯体自动感光，改由策略按环境光映射亮度")
+    }
+
+    // 1) 环境门限优先于占用判定：过亮关灯、昏暗且在座才开灯，各需持续 30 秒确认。
+    if ambientGateValid, let ambient, let closeThreshold, ambient >= closeThreshold, powerWriteAllowed {
+        if comboPolicyState.ambientBrightSince == nil { comboPolicyState.ambientBrightSince = now }
+        if let since = comboPolicyState.ambientBrightSince, now.timeIntervalSince(since) >= 30,
+           lamp.isPowerOn == true {
+            _ = statusIndicator.suspendPresenceForAmbientLock()
+            if lamp.setPower(on: false) {
+                setAmbientLampLock(true)
+                comboPolicyState.lastEnginePowerOffAt = now
+                comboPolicyState.lastPowerWriteAt = now
+                comboPolicyState.smoothedBrightness = nil
+                log("组合策略：环境分数 \(ambient) ≥ 明亮关灯点 \(closeThreshold) 持续 30 秒，已关闭 iScreenBar")
+            }
+            statusIndicator.setComboStatus("组合策略 · 环境过亮，已关灯")
+            return
+        }
+    } else {
+        comboPolicyState.ambientBrightSince = nil
+    }
+
+    if ambientGateValid, let ambient, let openThreshold, ambient <= openThreshold, powerWriteAllowed {
+        if comboPolicyState.ambientDarkSince == nil { comboPolicyState.ambientDarkSince = now }
+        if let since = comboPolicyState.ambientDarkSince, now.timeIntervalSince(since) >= 30,
+           lamp.isPowerOn != true, macActive, ambientTurnedLampOff {
+            if lamp.setPower(on: true) {
+                setAmbientLampLock(false)
+                statusIndicator.restorePresenceAfterAmbientLock()
+                comboPolicyState.lastEnginePowerOffAt = .distantPast
+                comboPolicyState.lastPowerWriteAt = now
+                log("组合策略：环境分数 \(ambient) ≤ 昏暗开灯点 \(openThreshold) 持续 30 秒且在座，已开启 iScreenBar")
+            }
+        }
+    } else {
+        comboPolicyState.ambientDarkSince = nil
+    }
+
+    // 2) 占用：灯体入座检测开着时由固件负责开关，App 不抢控制权；只在未启用固件入座检测时由 App 判定。
+    //    环境关灯锁定期间不参与，避免把刚被环境规则关掉的灯又打开。
+    // 环境已过亮时不再按占用开灯，避免“占用要开、门限要关”两个规则互相拉扯。
+    let ambientBrightBlocked = ambientGateValid && (ambient.flatMap { value in
+        closeThreshold.map { value >= $0 }
+    } ?? false)
+
+    // 2) 占用：灯体入座检测负责离座关灯，App 只在“近期有输入活动”时做补开纠正；
+    //    未启用灯体入座检测时，App 用 Mac 空闲时长双向判定。
+    //    环境关灯锁定期间与环境过亮时都不参与，避免把刚被环境关掉的灯又打开。
+    let recentActivity = idle < 60
+    if powerWriteAllowed, !ambientTurnedLampOff, !ambientBrightBlocked {
+        if lamp.isPowerOn == true {
+            if !presenceOn, !macActive,
+               now.timeIntervalSince(comboPolicyState.lastEnginePowerOffAt) > 120 {
+                if lamp.setPower(on: false) {
+                    comboPolicyState.lastEnginePowerOffAt = now
+                    comboPolicyState.lastPowerWriteAt = now
+                    comboPolicyState.smoothedBrightness = nil
+                    log("组合策略：Mac 空闲 \(Int(idle / 60)) 分钟且未启用灯体入座检测，关闭 iScreenBar")
+                }
+            }
+        } else if presenceOn ? recentActivity : macActive,
+                  now.timeIntervalSince(comboPolicyState.lastEnginePowerOffAt) > 120 {
+            if lamp.setPower(on: true) {
+                comboPolicyState.lastPowerWriteAt = now
+                log("组合策略：检测到在座\(presenceOn ? "（补开固件已关闭的灯）" : "")，开启 iScreenBar")
+            }
+        }
+    }
+
+    guard lamp.isPowerOn == true, let ambient else {
+        let reason: String
+        if lamp.isPowerOn != true {
+            if ambientTurnedLampOff {
+                reason = "环境关灯锁定中"
+            } else if presenceOn {
+                reason = "等待灯体入座检测开灯"
+            } else {
+                reason = macActive ? "保持关灯" : "未检测到在座"
+            }
+        } else {
+            reason = "等待环境光数据"
+        }
+        statusIndicator.setComboStatus("组合策略 · \(reason)")
+        return
+    }
+
+    // 3) 亮度：环境越暗灯越亮，在 [下限, 上限] 之间线性映射，再做平滑限速。
+    let brightnessCeiling = min(100, max(1, comboSetting("comboBrightnessMax", 80)))
+    let brightnessFloor = min(brightnessCeiling, max(1, comboSetting("comboBrightnessMin", 35)))
+    let lowAnchor = Double(openThreshold ?? 800)
+    let highAnchor = max(lowAnchor + 1, Double(closeThreshold ?? 1400))
+    let ratio = min(1, max(0, (Double(ambient) - lowAnchor) / (highAnchor - lowAnchor)))
+    let mapped = Double(brightnessCeiling) - Double(brightnessCeiling - brightnessFloor) * ratio
+
+    let previous = comboPolicyState.smoothedBrightness
+        ?? Double(lamp.currentBrightness ?? Int(mapped.rounded()))
+    // 单次最多变化 8%，避免环境光跳变时亮度阶梯突变造成“闪烁”。
+    let slewed = previous + max(-8, min(8, (mapped - previous) * 0.4))
+    comboPolicyState.smoothedBrightness = slewed
+    let appliedBrightness = max(1, min(100, Int(slewed.rounded())))
+    let currentBrightness = lamp.currentBrightness ?? appliedBrightness
+    if abs(appliedBrightness - currentBrightness) >= 3,
+       now.timeIntervalSince(comboPolicyState.lastBrightnessWriteAt) >= 15,
+       lamp.setBrightness(appliedBrightness) {
+        comboPolicyState.lastBrightness = appliedBrightness
+        comboPolicyState.lastBrightnessWriteAt = now
+        log("组合策略：环境分数 \(ambient) → 目标 \(Int(mapped.rounded()))%，平滑后亮度 \(appliedBrightness)%")
+    }
+
+    // 4) 色温：时段基线 ± 环境微调（暗更暖、亮更冷），单次最多 250K。
+    let baseline = statusIndicator.baselineTemperature(at: now)
+    let tweak = Int((Double(comboSetting("comboTemperatureTweakK", 400)) * (ratio * 2 - 1)).rounded())
+    let mappedTemperature = max(2700, min(6500, baseline + tweak))
+    let currentTemperature = lamp.currentTemperature ?? mappedTemperature
+    let temperatureStep = max(-250, min(250, mappedTemperature - currentTemperature))
+    let appliedTemperature = max(2700, min(6500, currentTemperature + temperatureStep))
+    if abs(appliedTemperature - currentTemperature) >= 100,
+       now.timeIntervalSince(comboPolicyState.lastTemperatureWriteAt) >= 60,
+       lamp.setTemperature(appliedTemperature) {
+        comboPolicyState.lastTemperature = appliedTemperature
+        comboPolicyState.lastTemperatureWriteAt = now
+        log("组合策略：时段基线 \(baseline)K 微调 \(tweak > 0 ? "+" : "")\(tweak)K → 色温 \(appliedTemperature)K")
+    }
+
+    statusIndicator.setComboStatus("组合策略 · \(macActive ? "在座" : "离座") · 亮度 \(appliedBrightness)% · 色温 \(appliedTemperature)K")
 }
 
 private func pollDisplayAndLamp() {
@@ -2936,6 +3215,7 @@ private func pollDisplayAndLamp() {
     let displayBrightnessLockEnabled = statusIndicator.isDisplayBrightnessLockEnabled
     let powerSyncEnabled = statusIndicator.isPowerSyncEnabled
     let ambientLinkEnabled = statusIndicator.isAmbientLinkEnabled
+    let comboEnabled = statusIndicator.isComboPolicyEnabled
     let ambientCloseThreshold = statusIndicator.ambientCloseThreshold
     let rawAmbientSource = (value: studioAmbientSensor.rawIlluminance(), name: "Studio Display 光线传感器")
     if ambientProxySourceName != rawAmbientSource.name {
@@ -3003,7 +3283,7 @@ private func pollDisplayAndLamp() {
         wasAmbientLinkEnabled = ambientLinkEnabled
     }
 
-    if ambientLinkEnabled, !isAsleep, let displayAmbientProxy {
+    if ambientLinkEnabled, !comboEnabled, !isAsleep, let displayAmbientProxy {
         if ambientTurnedLampOff {
             statusIndicator.maintainPresenceSuspendedForAmbientLock()
             ambientCloseCandidateSince = nil
@@ -3164,7 +3444,12 @@ private func pollDisplayAndLamp() {
         wasAsleep = isAsleep
     }
 
-    statusIndicator.applyScheduledTemperatureIfNeeded(isAsleep: isAsleep)
+    if !comboEnabled {
+        statusIndicator.applyScheduledTemperatureIfNeeded(isAsleep: isAsleep, force: false)
+    }
+
+    // 组合策略在熄屏/唤醒切换处理完之后接管，避免与熄屏同步抢写。
+    runComboPolicy(isAsleep: isAsleep, displayAmbientProxy: displayAmbientProxy)
 
     if displayBrightnessLockEnabled,
        !isAsleep,
@@ -3212,7 +3497,7 @@ private func pollDisplayAndLamp() {
         lastStudioDisplayBrightnessForLock = nil
     }
 
-    if brightnessFollowEnabled, !isAsleep, let displayID,
+    if brightnessFollowEnabled, !comboEnabled, !isAsleep, let displayID,
        let displayBrightness = displayBrightnessReader.percent(for: displayID) {
         if let anchorRevision = anchorStatusRevision,
            lamp.statusRevision > anchorRevision,
