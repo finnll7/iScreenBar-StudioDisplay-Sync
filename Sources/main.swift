@@ -616,6 +616,8 @@ private final class DisplayController {
 
 private final class StatusIndicator: NSObject {
     private let presenceDelayOptions = [180, 300, 600]
+    private let readingModeBrightness = 70
+    private let readingModeTemperature = 4200
     private let item: NSStatusItem
     private let lamp: LampController
     private let popover = NSPopover()
@@ -640,6 +642,7 @@ private final class StatusIndicator: NSObject {
     private let displayBrightnessLockSwitch = FeatureButton(title: "双屏亮度", symbol: "rectangle.on.rectangle", accentColor: activeControlColor)
     private let powerSyncSwitch = FeatureButton(title: "熄屏同步", symbol: "moon.zzz", accentColor: activeControlColor)
     private let keepAwakeSwitch = FeatureButton(title: "防止休眠", symbol: "cup.and.saucer", accentColor: activeControlColor)
+    private let readingModeSwitch = FeatureButton(title: "阅读模式", symbol: "book", accentColor: .systemGreen)
     private let keepAwakeController = KeepAwakeController()
     private let captureBrightButton = FeatureButton(title: "明亮关灯", symbol: "sun.max.fill", accentColor: .systemOrange)
     private let captureDarkButton = FeatureButton(title: "昏暗开灯", symbol: "moon.fill", accentColor: .systemBlue)
@@ -660,6 +663,7 @@ private final class StatusIndicator: NSObject {
     private(set) var isDisplayBrightnessLockEnabled: Bool
     private(set) var isPowerSyncEnabled: Bool
     private(set) var isTimeTemperatureEnabled: Bool
+    private(set) var isReadingModeEnabled: Bool
     private(set) var ambientCloseThreshold: Int?
     private(set) var ambientOpenThreshold: Int?
     private(set) var currentDisplayAmbientProxy: Int?
@@ -697,6 +701,7 @@ private final class StatusIndicator: NSObject {
         isDisplayBrightnessLockEnabled = UserDefaults.standard.bool(forKey: "displayBrightnessLockEnabled")
         isPowerSyncEnabled = UserDefaults.standard.object(forKey: "powerSyncEnabled") as? Bool ?? true
         isTimeTemperatureEnabled = UserDefaults.standard.bool(forKey: "timeTemperatureEnabled")
+        isReadingModeEnabled = UserDefaults.standard.bool(forKey: "readingModeEnabled")
         ambientCloseThreshold = UserDefaults.standard.object(forKey: "ambientCloseThreshold") as? Int
         ambientOpenThreshold = UserDefaults.standard.object(forKey: "ambientOpenThreshold") as? Int
         ambientThresholdSource = UserDefaults.standard.string(forKey: "ambientThresholdSource")
@@ -1136,6 +1141,113 @@ private final class StatusIndicator: NSObject {
         if !lamp.setVideoMode(enabled: requested) {
             videoModeSwitch.state = requested ? .off : .on
         }
+        lamp.requestStatus()
+    }
+
+    @objc private func readingModeChanged() {
+        if readingModeSwitch.state == .on {
+            enterReadingMode()
+        } else {
+            leaveReadingMode()
+        }
+    }
+
+    private func enterReadingMode() {
+        guard lamp.isConnected else {
+            readingModeSwitch.state = .off
+            NSSound.beep()
+            log("阅读模式未应用：iScreenBar 未连接")
+            return
+        }
+        // 环境光规则会持续把灯压回关闭状态，与固定组合互斥，进入前先停用并解除关灯锁定。
+        if isAmbientLinkEnabled {
+            areAmbientRulesEnabled = false
+            UserDefaults.standard.set(false, forKey: "ambientRulesEnabled")
+            if ambientTurnedLampOff {
+                setAmbientLampLock(false)
+                _ = lamp.setPower(on: true)
+            }
+            restorePresenceAfterAmbientLock()
+            updateAmbientStatusLabel()
+            log("阅读模式已停用环境光规则并解除关灯锁定")
+        }
+        if !isReadingModeEnabled,
+           let brightness = lamp.currentBrightness,
+           let temperature = lamp.currentTemperature {
+            let snapshot = SavedMode(name: "阅读模式前", brightness: brightness, temperature: temperature,
+                                     videoMode: lamp.isVideoModeEnabled == true)
+            if let data = try? JSONEncoder().encode(snapshot) {
+                UserDefaults.standard.set(data, forKey: "readingModeRestore")
+            }
+            // 自动感光开启时回读的手动亮度不可用作恢复值，退出时改回自动感光。
+            UserDefaults.standard.set(lamp.isAutoLightEnabled == true, forKey: "readingModeRestoreAutoLight")
+        }
+        // 亮度跟随与色温随时间会持续覆写固定组合，进入前先关掉，并记住原开关以便退出时回滚。
+        UserDefaults.standard.set(isBrightnessFollowEnabled, forKey: "readingModeRestoreBrightnessFollow")
+        UserDefaults.standard.set(isTimeTemperatureEnabled, forKey: "readingModeRestoreTimeTemperature")
+        if isBrightnessFollowEnabled {
+            isBrightnessFollowEnabled = false
+            brightnessFollowSwitch.state = .off
+            UserDefaults.standard.set(false, forKey: "brightnessFollowEnabled")
+            log("阅读模式已关闭 Studio Display 亮度跟随")
+        }
+        if isTimeTemperatureEnabled {
+            isTimeTemperatureEnabled = false
+            timeTemperatureSwitch.state = .off
+            lastScheduledTemperature = nil
+            lastScheduledTemperatureChangeAt = .distantPast
+            UserDefaults.standard.set(false, forKey: "timeTemperatureEnabled")
+            log("阅读模式已关闭色温随时间")
+        }
+        guard lamp.setPower(on: true),
+              lamp.setBrightness(readingModeBrightness),
+              lamp.setTemperature(readingModeTemperature) else {
+            readingModeSwitch.state = .off
+            NSSound.beep()
+            log("阅读模式应用失败：USB HID 指令未成功")
+            return
+        }
+        _ = lamp.setVideoMode(enabled: false)
+        isReadingModeEnabled = true
+        UserDefaults.standard.set(true, forKey: "readingModeEnabled")
+        log("已开启阅读模式：亮度 \(readingModeBrightness)%、色温 \(readingModeTemperature)K、视频模式关闭")
+        refreshControls()
+        lamp.requestStatus()
+    }
+
+    private func leaveReadingMode() {
+        isReadingModeEnabled = false
+        UserDefaults.standard.set(false, forKey: "readingModeEnabled")
+        guard let data = UserDefaults.standard.data(forKey: "readingModeRestore"),
+              let snapshot = try? JSONDecoder().decode(SavedMode.self, from: data) else {
+            log("已退出阅读模式，未找到可恢复的灯态")
+            refreshControls()
+            return
+        }
+        _ = lamp.setTemperature(snapshot.temperature)
+        _ = lamp.setVideoMode(enabled: snapshot.videoMode)
+        if UserDefaults.standard.bool(forKey: "readingModeRestoreAutoLight"), lamp.setAutoLight(enabled: true) {
+            log("已退出阅读模式，恢复自动感光与色温 \(snapshot.temperature)K")
+        } else if snapshot.brightness >= 5 {
+            _ = lamp.setBrightness(snapshot.brightness)
+            log("已退出阅读模式，恢复亮度 \(snapshot.brightness)%、色温 \(snapshot.temperature)K")
+        } else {
+            // 自动感光开启时回读的手动亮度是固件残留值（通常为 1%），不能当恢复值用。
+            log("已退出阅读模式，快照亮度 \(snapshot.brightness)% 无效（自动感光残留），保留当前亮度")
+        }
+        if UserDefaults.standard.bool(forKey: "readingModeRestoreTimeTemperature"), !isTimeTemperatureEnabled {
+            isTimeTemperatureEnabled = true
+            UserDefaults.standard.set(true, forKey: "timeTemperatureEnabled")
+            timeTemperatureSwitch.state = .on
+            log("已退出阅读模式，恢复色温随时间")
+        }
+        if UserDefaults.standard.bool(forKey: "readingModeRestoreBrightnessFollow"), !isBrightnessFollowEnabled {
+            isBrightnessFollowEnabled = true
+            UserDefaults.standard.set(true, forKey: "brightnessFollowEnabled")
+            brightnessFollowSwitch.state = .on
+            log("已退出阅读模式，恢复亮度跟随")
+        }
+        refreshControls()
         lamp.requestStatus()
     }
 
@@ -1816,6 +1928,9 @@ private final class StatusIndicator: NSObject {
         presenceSensitivityPopup.action = #selector(presenceSensitivityChanged)
         videoModeSwitch.target = self
         videoModeSwitch.action = #selector(videoModeChanged)
+        readingModeSwitch.target = self
+        readingModeSwitch.action = #selector(readingModeChanged)
+        readingModeSwitch.toolTip = "一键应用护眼组合：亮度 70%、色温 4200K、关闭视频模式；关闭时恢复进入前的灯态"
         modeButton.image = NSImage(systemSymbolName: "chevron.up.chevron.down", accessibilityDescription: nil)
         modeButton.imagePosition = .imageTrailing
         modeButton.alignment = .left
@@ -1909,12 +2024,13 @@ private final class StatusIndicator: NSObject {
         let featureGrid = NSGridView(views: [
             [powerSwitch, autoLightSwitch, presenceSwitch],
             [videoModeSwitch, brightnessFollowSwitch, powerSyncSwitch],
-            [timeTemperatureSwitch, displayBrightnessLockSwitch, keepAwakeSwitch]
+            [timeTemperatureSwitch, displayBrightnessLockSwitch, keepAwakeSwitch],
+            [readingModeSwitch, NSView(), NSView()]
         ])
         featureGrid.rowSpacing = 6
         featureGrid.columnSpacing = 6
         featureGrid.xPlacement = .fill
-        for button in [powerSwitch, autoLightSwitch, presenceSwitch, videoModeSwitch, brightnessFollowSwitch, powerSyncSwitch, timeTemperatureSwitch, displayBrightnessLockSwitch, keepAwakeSwitch] {
+        for button in [powerSwitch, autoLightSwitch, presenceSwitch, videoModeSwitch, brightnessFollowSwitch, powerSyncSwitch, timeTemperatureSwitch, displayBrightnessLockSwitch, keepAwakeSwitch, readingModeSwitch] {
             button.widthAnchor.constraint(equalToConstant: 100).isActive = true
             button.heightAnchor.constraint(equalToConstant: 40).isActive = true
         }
@@ -2018,7 +2134,7 @@ private final class StatusIndicator: NSObject {
         }
 
         let controller = NSViewController()
-        controller.view = NSView(frame: NSRect(x: 0, y: 0, width: UIStyle.panelWidth, height: 626))
+        controller.view = NSView(frame: NSRect(x: 0, y: 0, width: UIStyle.panelWidth, height: 672))
         controller.view.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: controller.view.leadingAnchor),
@@ -2027,7 +2143,7 @@ private final class StatusIndicator: NSObject {
             stack.bottomAnchor.constraint(lessThanOrEqualTo: controller.view.bottomAnchor)
         ])
         popover.contentViewController = controller
-        popover.contentSize = NSSize(width: UIStyle.panelWidth, height: 626)
+        popover.contentSize = NSSize(width: UIStyle.panelWidth, height: 672)
         popover.behavior = .transient
     }
 
@@ -2150,6 +2266,7 @@ private final class StatusIndicator: NSObject {
         powerSyncSwitch.state = isPowerSyncEnabled ? .on : .off
         keepAwakeSwitch.state = keepAwakeController.isActive ? .on : .off
         timeTemperatureSwitch.state = isTimeTemperatureEnabled ? .on : .off
+        readingModeSwitch.state = isReadingModeEnabled ? .on : .off
         updateAmbientStatusLabel()
         if let builtin = displayController.builtinDisplay() {
             let online = CGDisplayIsOnline(builtin) != 0
@@ -2186,6 +2303,7 @@ private final class StatusIndicator: NSObject {
         timeTemperatureSwitch.isEnabled = enabled
         presenceSwitch.isEnabled = enabled && !isAmbientPresenceLockActive && !isScreenSleepPresenceLockActive
         videoModeSwitch.isEnabled = enabled
+        readingModeSwitch.isEnabled = enabled
         powerSyncSwitch.isEnabled = enabled
         captureBrightButton.isEnabled = currentDisplayAmbientProxy != nil
         captureDarkButton.isEnabled = currentDisplayAmbientProxy != nil
