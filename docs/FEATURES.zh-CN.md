@@ -14,6 +14,7 @@
 - 悬停图标显示 iScreenBar 当前亮度和色温。
 - 点击面板时主动读取灯体状态，避免界面与实际灯体不一致。
 - 通过用户级 LaunchAgent 登录后自动运行，无需管理员权限。
+- 应用安装在 `~/Applications/iScreen Menu.app`（用户级，不是 `/Applications`）。可用 Spotlight 搜「iScreen Menu」或双击该 App 启动；面板底部「退出应用」或 `./scripts/stop.sh` 停止后，用 `./scripts/start.sh` 重新启动（下次登录仍会自动启动）。
 
 ## 2. iScreenBar 基础控制
 
