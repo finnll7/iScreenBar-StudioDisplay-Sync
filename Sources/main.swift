@@ -730,6 +730,7 @@ private final class StatusIndicator: NSObject {
     private var ambientThresholdSource: String?
     private var areAmbientRulesEnabled: Bool
     private var isDisplayAutoPresetEnabled: Bool
+    private var didSyncPresenceSettings = false
     private var isHealthy = true
     private var isStudioDisplayAvailable = false
     private let standbyLabel = NSTextField(labelWithString: "未检测到 Studio Display，功能待机")
@@ -1487,6 +1488,16 @@ private final class StatusIndicator: NSObject {
         _ = keepAwakeController.setActive(false)
         log("用户从面板退出应用，版本 \(appVersionText())")
         NSApp.terminate(nil)
+    }
+
+    /// 启动后把面板里的离席时间/灵敏度同步给灯体，避免两边参数不一致导致“以为改了但没生效”。
+    func syncPresenceSettingsIfNeeded() {
+        guard !didSyncPresenceSettings, let presenceEnabled = lamp.isPresenceDetectionEnabled else { return }
+        didSyncPresenceSettings = true
+        guard presenceEnabled else { return }
+        if lamp.setPresenceDetection(enabled: true, delaySeconds: presenceDelaySeconds, sensitivity: presenceSensitivity) {
+            log("已同步入座检测参数到灯体：离席 \(presenceDelaySeconds) 秒、灵敏度 \(presenceSensitivity)")
+        }
     }
 
     /// 策略引擎使用的时段色温基线（与「色温随时间」同一曲线）。
@@ -3373,6 +3384,7 @@ private func pollDisplayAndLamp() {
         statusIndicator.handleStudioDisplayConnection(connected: displayID != nil)
     }
     statusIndicator.setStudioDisplayAvailable(displayID != nil)
+    statusIndicator.syncPresenceSettingsIfNeeded()
     let isAsleep = displayID.map { CGDisplayIsAsleep($0) != 0 } ?? false
     let brightnessFollowEnabled = statusIndicator.isBrightnessFollowEnabled
     let displayBrightnessLockEnabled = statusIndicator.isDisplayBrightnessLockEnabled

@@ -4,6 +4,12 @@
 版本号写在 `Info.plist` 的 `CFBundleShortVersionString` / `CFBundleVersion`，面板底部会显示。
 每次发版：更新本文件 → 改 `Info.plist` → `./scripts/install.sh` → 面板核对版本与构建时间。
 
+## 0.3.10 (build 13) — 2026-11-21
+
+新增
+
+- 启动时把面板里的离席时间与灵敏度同步到灯体（日志：`已同步入座检测参数到灯体：离席 X 秒、灵敏度 Y`），避免“面板改了但固件没收到”。
+
 ## 0.3.9 (build 12) — 2026-11-21
 
 调整
