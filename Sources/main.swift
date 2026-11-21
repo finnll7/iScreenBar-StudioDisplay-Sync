@@ -3184,8 +3184,6 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     // 系统在部分上下文会返回 NaN/负值；无效值按“刚有活动”处理，避免整条策略静默失效。
     let idle = rawIdle.isFinite && rawIdle >= 0 ? rawIdle : 0
     let macActive = idle < TimeInterval(comboSetting("comboIdleSeconds", 600))
-    // 近期有输入活动：用于“灯体入座检测已把灯关掉”时的补开纠正。
-    let recentActivity = idle < 60
     let presenceOn = lamp.isPresenceDetectionEnabled == true
     let now = Date()
     // 等待首次状态回读，避免启动瞬间因电源状态未知而多写一次。
@@ -3223,7 +3221,8 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     //    Mac 空闲达到阈值（默认 10 分钟）即强制判离座——即便灯体入座检测仍认为有人，
     //    否则固件一旦判错，灯就会一直亮着。未达阈值时由“近期输入”或固件灯态决定。
     let macIdleOverLimit = idle >= TimeInterval(comboSetting("comboIdleSeconds", 600))
-    let present = !macIdleOverLimit && (recentActivity || !presenceOn || lamp.isPowerOn == true)
+    // 判在座：Mac 空闲未超阈值即视为在座；超阈值强制离座（不依赖固件怎么想）。
+    let present = !macIdleOverLimit
     if !present {
         if powerWriteAllowed, !ambientTurnedLampOff, lamp.isPowerOn == true,
            now.timeIntervalSince(comboPolicyState.lastEnginePowerOffAt) > 120 {
@@ -3274,11 +3273,17 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
             statusIndicator.setComboStatus("组合策略 · 环境关灯锁定中，等待变暗")
             return
         }
+        if presenceOn {
+            // 入座检测开启时，开灯交给灯体固件（毫秒级响应）；App 不再“补开”，
+            // 否则会与固件的离座关灯互相拉扯：固件关、App 开，灯就永远关不掉。
+            statusIndicator.setComboStatus("组合策略 · 灯灭，交由灯体入座检测点亮")
+            return
+        }
         if powerWriteAllowed, !ambientBright,
            now.timeIntervalSince(comboPolicyState.lastEnginePowerOffAt) > 120 {
             if lamp.setPower(on: true) {
                 comboPolicyState.lastPowerWriteAt = now
-                log("组合策略：检测到在座\(presenceOn ? "（补开固件已关闭的灯）" : "")，开启 iScreenBar")
+                log("组合策略：检测到在座，开启 iScreenBar")
             }
         }
     }
