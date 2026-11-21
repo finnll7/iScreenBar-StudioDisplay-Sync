@@ -110,16 +110,27 @@ final class PanelModel: ObservableObject {
 private struct GlassCard: ViewModifier {
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
-            content.glassEffect(.regular, in: .rect(cornerRadius: 16))
+            content
+                .glassEffect(.regular.tint(.white.opacity(0.06)), in: .rect(cornerRadius: 20))
+                .overlay(specularBorder(cornerRadius: 20))
         } else {
             content
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .strokeBorder(.white.opacity(0.14), lineWidth: 0.5)
-                )
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .overlay(specularBorder(cornerRadius: 20))
         }
     }
+}
+
+/// 玻璃边缘的镜面高光：左上亮、右下暗，制造厚度感。
+private func specularBorder(cornerRadius: CGFloat) -> some View {
+    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        .strokeBorder(
+            LinearGradient(colors: [.white.opacity(0.55), .white.opacity(0.08), .white.opacity(0.28)],
+                           startPoint: .topLeading,
+                           endPoint: .bottomTrailing),
+            lineWidth: 0.9
+        )
+        .allowsHitTesting(false)
 }
 
 private extension View {
@@ -140,6 +151,24 @@ struct GlassPanelView: View {
     private var actions: PanelActions { model.actions }
 
     var body: some View {
+        GlassEffectContainer(spacing: 14) {
+            panelContent
+        }
+        .frame(width: 372, height: 720)
+        .background(panelBackdrop)
+    }
+
+    /// 很淡的双色渐变：给玻璃提供可折射的内容，否则玻璃看起来像普通灰块。
+    private var panelBackdrop: some View {
+        LinearGradient(
+            colors: [Color.accentColor.opacity(0.16), Color.clear, Color.blue.opacity(0.10)],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+        .ignoresSafeArea()
+    }
+
+    private var panelContent: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 12) {
                 header
@@ -166,8 +195,6 @@ struct GlassPanelView: View {
             }
             .padding(16)
         }
-        .frame(width: 372, height: 720)
-        .background(.clear)
     }
 
     private var header: some View {

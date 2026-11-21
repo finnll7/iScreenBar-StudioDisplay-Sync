@@ -669,7 +669,7 @@ private final class DisplayController {
 }
 
 private final class StatusIndicator: NSObject {
-    private let presenceDelayOptions = [60, 180, 300, 600]
+    private let presenceDelayOptions = [180, 300, 600]
     private let readingModeBrightness = 70
     private let readingModeTemperature = 4200
     private let item: NSStatusItem
@@ -733,6 +733,7 @@ private final class StatusIndicator: NSObject {
     private var isDisplayAutoPresetEnabled: Bool
     private var didSyncPresenceSettings = false
     private let panelModel = PanelModel()
+    private var glassHostController: NSViewController?
     private var isHealthy = true
     private var isStudioDisplayAvailable = false
     private let standbyLabel = NSTextField(labelWithString: "未检测到 Studio Display，功能待机")
@@ -2769,6 +2770,9 @@ private final class StatusIndicator: NSObject {
         )
         let host = NSHostingController(rootView: GlassPanelView(model: panelModel))
         host.view.frame = NSRect(x: 0, y: 0, width: 372, height: 720)
+        host.view.wantsLayer = true
+        host.view.layer?.backgroundColor = NSColor.clear.cgColor
+        glassHostController = host
         popover.contentViewController = host
         popover.contentSize = NSSize(width: 372, height: 720)
     }
