@@ -1490,13 +1490,22 @@ private final class StatusIndicator: NSObject {
         NSApp.terminate(nil)
     }
 
+    /// 灵敏度枚举对应的中文，便于读日志时不再误以为 2 是“两档”之类的含义。
+    private func presenceSensitivityLabel(_ value: Int) -> String {
+        switch value {
+        case 0: return "低(0)"
+        case 1: return "中(1)"
+        default: return "高(2)"
+        }
+    }
+
     /// 启动后把面板里的离席时间/灵敏度同步给灯体，避免两边参数不一致导致“以为改了但没生效”。
     func syncPresenceSettingsIfNeeded() {
         guard !didSyncPresenceSettings, let presenceEnabled = lamp.isPresenceDetectionEnabled else { return }
         didSyncPresenceSettings = true
         guard presenceEnabled else { return }
         if lamp.setPresenceDetection(enabled: true, delaySeconds: presenceDelaySeconds, sensitivity: presenceSensitivity) {
-            log("已同步入座检测参数到灯体：离席 \(presenceDelaySeconds) 秒、灵敏度 \(presenceSensitivity)")
+            log("已同步入座检测参数到灯体：离席 \(presenceDelaySeconds) 秒、灵敏度 \(presenceSensitivityLabel(presenceSensitivity))")
         }
     }
 
