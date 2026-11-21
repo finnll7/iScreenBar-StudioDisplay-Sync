@@ -18,6 +18,45 @@ private func log(_ message: String) {
     fflush(stdout)
 }
 
+/// 版本与构建时间（从 bundle 读取，发版时只改 Info.plist）。
+private func appVersionText() -> String {
+    let info = Bundle.main.infoDictionary
+    let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+    let build = info?["CFBundleVersion"] as? String ?? "?"
+    var stamp = "—"
+    if let url = Bundle.main.executableURL,
+       let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM-dd HH:mm"
+        stamp = formatter.string(from: date)
+    }
+    return "v\(short) (\(build)) · 构建 \(stamp)"
+}
+
+/// 两个实例同时写同一个灯体会造成开关抖动，因此只保留先启动的实例。
+/// 重装时旧进程可能尚未回收，先短暂等待，避免把刚启动的新实例误杀。
+private func enforceSingleInstance() {
+    let me = ProcessInfo.processInfo.processIdentifier
+    let identifier = Bundle.main.bundleIdentifier ?? "local.qiu.iScreenBarStudioSync"
+    func otherInstance() -> NSRunningApplication? {
+        return NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
+            .first { $0.processIdentifier != me && !$0.isTerminated }
+    }
+    for attempt in 0..<30 {
+        guard let other = otherInstance() else { return }
+        if attempt == 0 {
+            log("检测到已有实例在运行：pid \(other.processIdentifier) 路径 \(other.bundleURL?.path ?? "未知")，等待其退出")
+        }
+        Thread.sleep(forTimeInterval: 0.1)
+    }
+    if let other = otherInstance() {
+        log("已有实例持续运行中（pid \(other.processIdentifier) 路径 \(other.bundleURL?.path ?? "未知")），本实例退出以免重复写灯体")
+        exit(0)
+    }
+}
+
+enforceSingleInstance()
+
 private let activeControlColor = NSColor.controlAccentColor
 
 private func requestSystemDisplaySleep() -> Bool {
@@ -1391,22 +1430,8 @@ private final class StatusIndicator: NSObject {
         pendingBuiltinWakeWorkItems.removeAll()
         _ = displayController.setStudioEnabled(true)
         _ = keepAwakeController.setActive(false)
-        log("用户从面板退出应用，版本 \(Self.versionText())")
+        log("用户从面板退出应用，版本 \(appVersionText())")
         NSApp.terminate(nil)
-    }
-
-    private static func versionText() -> String {
-        let info = Bundle.main.infoDictionary
-        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
-        let build = info?["CFBundleVersion"] as? String ?? "?"
-        var stamp = "—"
-        if let url = Bundle.main.executableURL,
-           let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "MM-dd HH:mm"
-            stamp = formatter.string(from: date)
-        }
-        return "v\(short) (\(build)) · 构建 \(stamp)"
     }
 
     /// 策略引擎使用的时段色温基线（与「色温随时间」同一曲线）。
@@ -2307,7 +2332,7 @@ private final class StatusIndicator: NSObject {
         standbyLabel.textColor = .secondaryLabelColor
         standbyLabel.isHidden = isStudioDisplayAvailable
         standbyLabel.widthAnchor.constraint(equalToConstant: UIStyle.contentWidth).isActive = true
-        versionLabel.stringValue = Self.versionText()
+        versionLabel.stringValue = appVersionText()
         versionLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
         versionLabel.textColor = .tertiaryLabelColor
         let quitButton = NSButton(title: "退出应用", target: self, action: #selector(quitApplication))
@@ -3008,6 +3033,7 @@ private func setAmbientLampLock(_ active: Bool) {
     }
 }
 private let statusIndicator = StatusIndicator(isAsleep: wasAsleep, lamp: lamp)
+log("启动：\(Bundle.main.bundleURL.path)，\(appVersionText())")
 log("策略状态：智能组合=\(statusIndicator.isComboPolicyEnabled ? "开" : "关")，环境规则=\(statusIndicator.isAmbientLinkEnabled ? "开" : "关")，标定=关灯\(statusIndicator.ambientCloseThreshold.map(String.init) ?? "无")/开灯\(statusIndicator.ambientOpenThreshold.map(String.init) ?? "无")")
 statusIndicator.handleStudioDisplayConnection(connected: displayID != nil)
 if !wasAsleep {

@@ -4,6 +4,13 @@
 版本号写在 `Info.plist` 的 `CFBundleShortVersionString` / `CFBundleVersion`，面板底部会显示。
 每次发版：更新本文件 → 改 `Info.plist` → `./scripts/install.sh` → 面板核对版本与构建时间。
 
+## 0.3.1 (build 4) — 2026-11-21
+
+修复
+
+- 单实例保护：同一个 bundle id 已有实例在运行时，新实例等待最多 3 秒后退出，避免两份安装（如 `/Applications` 旧版与 `~/Applications` 新版）同时写灯体造成开关抖动。
+- 启动日志记录应用路径与版本，便于确认当前运行的是哪一份安装。
+
 ## 0.3.0 (build 3) — 2026-11-21
 
 新增
