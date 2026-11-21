@@ -126,6 +126,8 @@ private final class HighlightSliderCell: NSSliderCell {
 private final class InteractiveSlider: NSSlider {
     private let activeColor: NSColor
     private let highlightCell: HighlightSliderCell
+    /// 拖动开始/结束回调，用于在拖动期间实显数值与限速下发。
+    var onTrackingChanged: ((Bool) -> Void)?
 
     init(value: Double, minValue: Double, maxValue: Double, activeColor: NSColor) {
         self.activeColor = activeColor
@@ -142,6 +144,7 @@ private final class InteractiveSlider: NSSlider {
     required init?(coder: NSCoder) { nil }
 
     override func mouseDown(with event: NSEvent) {
+        onTrackingChanged?(true)
         highlightCell.isInteracting = true
         needsDisplay = true
         NSAnimationContext.runAnimationGroup { context in
@@ -155,6 +158,7 @@ private final class InteractiveSlider: NSSlider {
             context.duration = 0.18
             layer?.backgroundColor = NSColor.clear.cgColor
         }
+        onTrackingChanged?(false)
     }
 }
 
@@ -747,6 +751,15 @@ private final class StatusIndicator: NSObject {
     private var didRequestDisplaySleepForCurrentLidClosure = false
     /// 点采集按钮后短暂忽略输入框结束编辑的回写，避免旧文本覆盖新采集值。
     private var thresholdCommitSuppressedUntil = Date.distantPast
+    /// 滑块拖动中的实时数值与限速写入状态。
+    private var isBrightnessSliderTracking = false
+    private var isTemperatureSliderTracking = false
+    private var lastSliderWriteAt = Date.distantPast
+    private var pendingBrightnessValue: Int?
+    private var pendingTemperatureValue: Int?
+
+    /// 用户正在拖滑块时，策略引擎不覆写亮度色温。
+    var isUserAdjustingLamp: Bool { isBrightnessSliderTracking || isTemperatureSliderTracking }
 
     private var isBuiltinManuallyDisabled: Bool {
         get { UserDefaults.standard.bool(forKey: "builtinManuallyDisabled") }
@@ -1148,17 +1161,54 @@ private final class StatusIndicator: NSObject {
     @objc private func brightnessChanged() {
         let value = Int(brightnessSlider.doubleValue.rounded())
         brightnessValueLabel.stringValue = "\(value)%"
-        markManualOverride()
-        _ = lamp.setBrightness(value)
-        lamp.requestStatus()
+        guard isBrightnessSliderTracking else {
+            _ = lamp.setBrightness(value)
+            markManualOverride()
+            lamp.requestStatus()
+            return
+        }
+        // 拖动中：标签随时刷新，灯体写入限速 80ms，避免刷 HID 报文。
+        let now = Date()
+        if now.timeIntervalSince(lastSliderWriteAt) >= 0.08 {
+            lastSliderWriteAt = now
+            _ = lamp.setBrightness(value)
+            pendingBrightnessValue = nil
+        } else {
+            pendingBrightnessValue = value
+        }
     }
 
     @objc private func temperatureChanged() {
         let value = Int((temperatureSlider.doubleValue / 100).rounded()) * 100
         temperatureSlider.doubleValue = Double(value)
         temperatureValueLabel.stringValue = "\(value)K"
+        guard isTemperatureSliderTracking else {
+            _ = lamp.setTemperature(value)
+            markManualOverride()
+            lamp.requestStatus()
+            return
+        }
+        let now = Date()
+        if now.timeIntervalSince(lastSliderWriteAt) >= 0.08 {
+            lastSliderWriteAt = now
+            _ = lamp.setTemperature(value)
+            pendingTemperatureValue = nil
+        } else {
+            pendingTemperatureValue = value
+        }
+    }
+
+    /// 松手后补写最后一个值，并同步回读。
+    private func flushSliderInteraction() {
+        if let pending = pendingBrightnessValue {
+            _ = lamp.setBrightness(pending)
+            pendingBrightnessValue = nil
+        }
+        if let pending = pendingTemperatureValue {
+            _ = lamp.setTemperature(pending)
+            pendingTemperatureValue = nil
+        }
         markManualOverride()
-        _ = lamp.setTemperature(value)
         lamp.requestStatus()
     }
 
@@ -2101,10 +2151,20 @@ private final class StatusIndicator: NSObject {
         powerSwitch.action = #selector(powerChanged)
         brightnessSlider.target = self
         brightnessSlider.action = #selector(brightnessChanged)
-        brightnessSlider.isContinuous = false
+        brightnessSlider.isContinuous = true
+        brightnessSlider.onTrackingChanged = { [weak self] tracking in
+            guard let self else { return }
+            self.isBrightnessSliderTracking = tracking
+            if !tracking { self.flushSliderInteraction() }
+        }
         temperatureSlider.target = self
         temperatureSlider.action = #selector(temperatureChanged)
-        temperatureSlider.isContinuous = false
+        temperatureSlider.isContinuous = true
+        temperatureSlider.onTrackingChanged = { [weak self] tracking in
+            guard let self else { return }
+            self.isTemperatureSliderTracking = tracking
+            if !tracking { self.flushSliderInteraction() }
+        }
         temperatureSlider.numberOfTickMarks = 5
         temperatureSlider.tickMarkPosition = .below
         timeTemperatureSwitch.target = self
@@ -2524,11 +2584,11 @@ private final class StatusIndicator: NSObject {
         rotationModeButton.title = loadRotationPreset().name
         selectPresenceDelay(presenceDelaySeconds)
         presenceSensitivityPopup.selectItem(withTag: presenceSensitivity)
-        if let brightness = lamp.currentBrightness {
+        if let brightness = lamp.currentBrightness, !isBrightnessSliderTracking {
             brightnessSlider.doubleValue = Double(brightness)
             brightnessValueLabel.stringValue = "\(brightness)%"
         }
-        if let temperature = lamp.currentTemperature {
+        if let temperature = lamp.currentTemperature, !isTemperatureSliderTracking {
             temperatureSlider.doubleValue = Double(temperature)
             temperatureValueLabel.stringValue = "\(temperature)K"
         }
@@ -3109,6 +3169,10 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     }
     if statusIndicator.isReadingModeEnabled {
         statusIndicator.setComboStatus("组合策略 · 阅读模式优先，暂停自动调整")
+        return
+    }
+    if statusIndicator.isUserAdjustingLamp {
+        statusIndicator.setComboStatus("组合策略 · 正在手动调节，暂停自动调整")
         return
     }
 
