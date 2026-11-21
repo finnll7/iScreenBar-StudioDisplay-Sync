@@ -1073,7 +1073,11 @@ private final class StatusIndicator: NSObject {
             (ambientCloseThreshold != nil || ambientOpenThreshold != nil)
         let currentText = currentDisplayAmbientProxy.map { "当前环境 \($0)" } ?? "当前环境 --"
         if isComboPolicyEnabled {
-            ambientStatusLabel.stringValue = "\(currentText)  ·  组合模式用作亮度映射区间"
+            if let close = ambientCloseThreshold, let open = ambientOpenThreshold, open >= close {
+                ambientStatusLabel.stringValue = "\(currentText)  ·  数值重叠，环境门限已忽略，仅按亮度映射"
+            } else {
+                ambientStatusLabel.stringValue = "\(currentText)  ·  组合模式用作亮度映射区间"
+            }
         } else if let close = ambientCloseThreshold, let open = ambientOpenThreshold, open >= close {
             ambientStatusLabel.stringValue = "\(currentText)  ·  阈值重叠，可能反复开关"
         } else if !areAmbientRulesEnabled, ambientCloseThreshold != nil || ambientOpenThreshold != nil {
@@ -1358,6 +1362,12 @@ private final class StatusIndicator: NSObject {
             comboManualOverrideUntil = Date().addingTimeInterval(30)
             log("已开启智能组合策略：入座与 Mac 活动决定开关，环境光决定亮度，时段为主决定色温")
         } else {
+            // 引擎因环境过亮关灯时会暂停固件入座检测与自动感光，关闭组合时必须释放，否则会一直卡在暂停。
+            if ambientTurnedLampOff {
+                setAmbientLampLock(false)
+                restorePresenceAfterAmbientLock()
+            }
+            updateAmbientStatusLabel()
             log("已关闭智能组合策略，恢复各功能独立工作")
         }
         refreshControls()
@@ -1593,10 +1603,14 @@ private final class StatusIndicator: NSObject {
     }
 
     func applyModeForFrontmostAppIfNeeded() {
+        // 未连接 Studio Display 时处于待机，不做任何灯体写入。
+        guard isStudioDisplayAvailable, lamp.isConnected else { return }
         guard let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
               bundleID != lastFrontmostBundleID else { return }
         lastFrontmostBundleID = bundleID
         guard let mode = loadAppModes()[bundleID] else { return }
+        // 组合模式下应用绑定属于用户显式动作，写入后给引擎一个保护期。
+        if isComboPolicyEnabled { markManualOverride() }
         _ = lamp.setPower(on: true)
         _ = lamp.setBrightness(mode.brightness)
         _ = lamp.setTemperature(mode.temperature)
@@ -3013,6 +3027,10 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
         statusIndicator.setComboStatus("组合策略 · 手动设置保护中，暂不覆写")
         return
     }
+    if statusIndicator.isReadingModeEnabled {
+        statusIndicator.setComboStatus("组合策略 · 阅读模式优先，暂停自动调整")
+        return
+    }
 
     let closeThreshold = statusIndicator.ambientCloseThreshold
     let openThreshold = statusIndicator.ambientOpenThreshold
@@ -3021,6 +3039,8 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     // 系统在部分上下文会返回 NaN/负值；无效值按“刚有活动”处理，避免整条策略静默失效。
     let idle = rawIdle.isFinite && rawIdle >= 0 ? rawIdle : 0
     let macActive = idle < TimeInterval(comboSetting("comboIdleSeconds", 600))
+    // 近期有输入活动：用于“灯体入座检测已把灯关掉”时的补开纠正。
+    let recentActivity = idle < 60
     let presenceOn = lamp.isPresenceDetectionEnabled == true
     let now = Date()
     // 等待首次状态回读，避免启动瞬间因电源状态未知而多写一次。
@@ -3041,6 +3061,12 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
         comboPolicyState.didWarnThresholdOverlap = true
         log("组合策略：昏暗开灯点不低于明亮关灯点，环境门限已忽略，仅按亮度映射工作")
     }
+    let ambientBright = ambientGateValid && (ambient.flatMap { value in
+        closeThreshold.map { value >= $0 }
+    } ?? false)
+    let ambientDark = ambientGateValid && (ambient.flatMap { value in
+        openThreshold.map { value <= $0 }
+    } ?? false)
 
     // 灯体自动感光会持续覆写亮度，与策略引擎冲突，发现即关闭。
     if lamp.isAutoLightEnabled == true {
@@ -3048,18 +3074,34 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
         log("组合策略：已关闭灯体自动感光，改由策略按环境光映射亮度")
     }
 
-    // 1) 环境门限优先于占用判定：过亮关灯、昏暗且在座才开灯，各需持续 30 秒确认。
-    if ambientGateValid, let ambient, let closeThreshold, ambient >= closeThreshold, powerWriteAllowed {
+    // 1) 入座优先：无人在座时不做任何环境动作，只按需要关灯。
+    //    灯体入座检测开着时，“灯亮”或“近期有输入”均视为在座（固件负责离座关灯）。
+    let present = presenceOn ? (lamp.isPowerOn == true || recentActivity) : macActive
+    if !present {
+        if powerWriteAllowed, !presenceOn, !ambientTurnedLampOff, lamp.isPowerOn == true,
+           now.timeIntervalSince(comboPolicyState.lastEnginePowerOffAt) > 120 {
+            if lamp.setPower(on: false) {
+                comboPolicyState.lastEnginePowerOffAt = now
+                comboPolicyState.lastPowerWriteAt = now
+                comboPolicyState.smoothedBrightness = nil
+                log("组合策略：Mac 空闲 \(Int(idle / 60)) 分钟且未启用灯体入座检测，关闭 iScreenBar")
+            }
+        }
+        statusIndicator.setComboStatus("组合策略 · 未检测到在座")
+        return
+    }
+
+    // 2) 在座后再看环境：过亮持续 30 秒关灯（同时暂停固件入座检测与自动感光）。
+    if ambientBright, powerWriteAllowed, lamp.isPowerOn == true {
         if comboPolicyState.ambientBrightSince == nil { comboPolicyState.ambientBrightSince = now }
-        if let since = comboPolicyState.ambientBrightSince, now.timeIntervalSince(since) >= 30,
-           lamp.isPowerOn == true {
+        if let since = comboPolicyState.ambientBrightSince, now.timeIntervalSince(since) >= 30 {
             _ = statusIndicator.suspendPresenceForAmbientLock()
             if lamp.setPower(on: false) {
                 setAmbientLampLock(true)
                 comboPolicyState.lastEnginePowerOffAt = now
                 comboPolicyState.lastPowerWriteAt = now
                 comboPolicyState.smoothedBrightness = nil
-                log("组合策略：环境分数 \(ambient) ≥ 明亮关灯点 \(closeThreshold) 持续 30 秒，已关闭 iScreenBar")
+                log("组合策略：在座且环境分数 \(ambient ?? 0) ≥ 明亮关灯点 \(closeThreshold ?? 0) 持续 30 秒，已关闭 iScreenBar")
             }
             statusIndicator.setComboStatus("组合策略 · 环境过亮，已关灯")
             return
@@ -3068,46 +3110,27 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
         comboPolicyState.ambientBrightSince = nil
     }
 
-    if ambientGateValid, let ambient, let openThreshold, ambient <= openThreshold, powerWriteAllowed {
-        if comboPolicyState.ambientDarkSince == nil { comboPolicyState.ambientDarkSince = now }
-        if let since = comboPolicyState.ambientDarkSince, now.timeIntervalSince(since) >= 30,
-           lamp.isPowerOn != true, macActive, ambientTurnedLampOff {
-            if lamp.setPower(on: true) {
-                setAmbientLampLock(false)
-                statusIndicator.restorePresenceAfterAmbientLock()
-                comboPolicyState.lastEnginePowerOffAt = .distantPast
-                comboPolicyState.lastPowerWriteAt = now
-                log("组合策略：环境分数 \(ambient) ≤ 昏暗开灯点 \(openThreshold) 持续 30 秒且在座，已开启 iScreenBar")
-            }
-        }
-    } else {
-        comboPolicyState.ambientDarkSince = nil
-    }
-
-    // 2) 占用：灯体入座检测开着时由固件负责开关，App 不抢控制权；只在未启用固件入座检测时由 App 判定。
-    //    环境关灯锁定期间不参与，避免把刚被环境规则关掉的灯又打开。
-    // 环境已过亮时不再按占用开灯，避免“占用要开、门限要关”两个规则互相拉扯。
-    let ambientBrightBlocked = ambientGateValid && (ambient.flatMap { value in
-        closeThreshold.map { value >= $0 }
-    } ?? false)
-
-    // 2) 占用：灯体入座检测负责离座关灯，App 只在“近期有输入活动”时做补开纠正；
-    //    未启用灯体入座检测时，App 用 Mac 空闲时长双向判定。
-    //    环境关灯锁定期间与环境过亮时都不参与，避免把刚被环境关掉的灯又打开。
-    let recentActivity = idle < 60
-    if powerWriteAllowed, !ambientTurnedLampOff, !ambientBrightBlocked {
-        if lamp.isPowerOn == true {
-            if !presenceOn, !macActive,
-               now.timeIntervalSince(comboPolicyState.lastEnginePowerOffAt) > 120 {
-                if lamp.setPower(on: false) {
-                    comboPolicyState.lastEnginePowerOffAt = now
+    // 3) 在座但灯未亮：环境关灯锁定期间要等环境回到开灯点；否则直接补开。
+    if lamp.isPowerOn != true {
+        if ambientTurnedLampOff {
+            if ambientDark {
+                if comboPolicyState.ambientDarkSince == nil { comboPolicyState.ambientDarkSince = now }
+                if let since = comboPolicyState.ambientDarkSince, now.timeIntervalSince(since) >= 30,
+                   powerWriteAllowed, lamp.setPower(on: true) {
+                    setAmbientLampLock(false)
+                    statusIndicator.restorePresenceAfterAmbientLock()
+                    comboPolicyState.lastEnginePowerOffAt = .distantPast
                     comboPolicyState.lastPowerWriteAt = now
-                    comboPolicyState.smoothedBrightness = nil
-                    log("组合策略：Mac 空闲 \(Int(idle / 60)) 分钟且未启用灯体入座检测，关闭 iScreenBar")
+                    log("组合策略：环境分数 \(ambient ?? 0) ≤ 昏暗开灯点 \(openThreshold ?? 0) 持续 30 秒，已开启 iScreenBar")
                 }
+            } else {
+                comboPolicyState.ambientDarkSince = nil
             }
-        } else if presenceOn ? recentActivity : macActive,
-                  now.timeIntervalSince(comboPolicyState.lastEnginePowerOffAt) > 120 {
+            statusIndicator.setComboStatus("组合策略 · 环境关灯锁定中，等待变暗")
+            return
+        }
+        if powerWriteAllowed, !ambientBright,
+           now.timeIntervalSince(comboPolicyState.lastEnginePowerOffAt) > 120 {
             if lamp.setPower(on: true) {
                 comboPolicyState.lastPowerWriteAt = now
                 log("组合策略：检测到在座\(presenceOn ? "（补开固件已关闭的灯）" : "")，开启 iScreenBar")
@@ -3116,19 +3139,7 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     }
 
     guard lamp.isPowerOn == true, let ambient else {
-        let reason: String
-        if lamp.isPowerOn != true {
-            if ambientTurnedLampOff {
-                reason = "环境关灯锁定中"
-            } else if presenceOn {
-                reason = "等待灯体入座检测开灯"
-            } else {
-                reason = macActive ? "保持关灯" : "未检测到在座"
-            }
-        } else {
-            reason = "等待环境光数据"
-        }
-        statusIndicator.setComboStatus("组合策略 · \(reason)")
+        statusIndicator.setComboStatus(ambient == nil ? "组合策略 · 等待环境光数据" : "组合策略 · 在座，等待开灯条件")
         return
     }
 
@@ -3444,7 +3455,8 @@ private func pollDisplayAndLamp() {
         wasAsleep = isAsleep
     }
 
-    if !comboEnabled {
+    // 待机（未连接 Studio Display）时不写灯体设置。
+    if !comboEnabled, displayID != nil {
         statusIndicator.applyScheduledTemperatureIfNeeded(isAsleep: isAsleep, force: false)
     }
 
