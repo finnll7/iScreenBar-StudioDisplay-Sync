@@ -3287,10 +3287,10 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     }
 
     // 3) 亮度：环境越暗灯越亮，在 [下限, 上限] 之间线性映射，再做平滑限速。
-    let brightnessCeiling = min(100, max(1, comboSetting("comboBrightnessMax", 65)))
+    let brightnessCeiling = min(100, max(1, comboSetting("comboBrightnessMax", 75)))
     let brightnessFloor = min(brightnessCeiling, max(1, comboSetting("comboBrightnessMin", 40)))
     let mapDark = Double(comboSetting("comboMapDark", 100))
-    let mapBright = max(mapDark + 1, Double(comboSetting("comboMapBright", 1900)))
+    let mapBright = max(mapDark + 1, Double(comboSetting("comboMapBright", 1200)))
     let ratio = min(1, max(0, (Double(ambient) - mapDark) / (mapBright - mapDark)))
     let mapped = Double(brightnessCeiling) - Double(brightnessCeiling - brightnessFloor) * ratio
 
