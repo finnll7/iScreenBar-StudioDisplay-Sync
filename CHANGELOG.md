@@ -4,6 +4,12 @@
 版本号写在 `Info.plist` 的 `CFBundleShortVersionString` / `CFBundleVersion`，面板底部会显示。
 每次发版：更新本文件 → 改 `Info.plist` → `./scripts/install.sh` → 面板核对版本与构建时间。
 
+## 0.3.9 (build 12) — 2026-11-21
+
+调整
+
+- 「离席时间」新增 **1 分钟** 选项（原为 3/5/10 分钟），便于把固件的离座关灯判定压到 60 秒。
+
 ## 0.3.8 (build 11) — 2026-11-21
 
 修复

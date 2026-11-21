@@ -668,7 +668,7 @@ private final class DisplayController {
 }
 
 private final class StatusIndicator: NSObject {
-    private let presenceDelayOptions = [180, 300, 600]
+    private let presenceDelayOptions = [60, 180, 300, 600]
     private let readingModeBrightness = 70
     private let readingModeTemperature = 4200
     private let item: NSStatusItem
