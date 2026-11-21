@@ -4,6 +4,19 @@
 版本号写在 `Info.plist` 的 `CFBundleShortVersionString` / `CFBundleVersion`，面板底部会显示。
 每次发版：更新本文件 → 改 `Info.plist` → `./scripts/install.sh` → 面板核对版本与构建时间。
 
+## 0.3.2 (build 5) — 2026-11-21
+
+新增
+
+- 应用图标（`Resources/AppIcon.icns`，可用 `tools/make_icon.swift` 重新生成），不再显示默认空白图标。
+- 亮度映射区间改为独立参数 `comboMapDark`（默认 100）/ `comboMapBright`（默认 1900），不再绑定环境光门限，避免门限变化时映射区间被扭曲。
+
+修复
+
+- 面板「启用」开关存在两处 `isEnabled` 赋值互相覆盖，组合模式下仍可点击；现统一为单一数据源。
+- 亮度平滑值在关灯/重启后被重置，导致 32% ↔ 80% 来回跳变（看起来像闪烁）；现从目标值起步并保留历史，单次变化 ≤ 6%、6 秒节流。
+- 重装时 `bootout` 后旧进程未回收，新实例被单实例保护误杀且不自动重启；`install.sh` 现在会等待旧进程退出。
+
 ## 0.3.1 (build 4) — 2026-11-21
 
 修复

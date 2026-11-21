@@ -17,6 +17,8 @@ xcrun swiftc -O \
   -o "$executable_dir/iScreenBarStudioSync"
 
 install -m 644 "$project_dir/Info.plist" "$app_dir/Contents/Info.plist"
+mkdir -p "$app_dir/Contents/Resources"
+install -m 644 "$project_dir/Resources/AppIcon.icns" "$app_dir/Contents/Resources/AppIcon.icns"
 codesign --force --deep --sign - "$app_dir"
 
 echo "Built: $app_dir"

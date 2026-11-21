@@ -42,7 +42,7 @@ private func enforceSingleInstance() {
         return NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
             .first { $0.processIdentifier != me && !$0.isTerminated }
     }
-    for attempt in 0..<30 {
+    for attempt in 0..<80 {
         guard let other = otherInstance() else { return }
         if attempt == 0 {
             log("检测到已有实例在运行：pid \(other.processIdentifier) 路径 \(other.bundleURL?.path ?? "未知")，等待其退出")
@@ -1118,8 +1118,12 @@ private final class StatusIndicator: NSObject {
         syncThresholdFields()
         captureBrightButton.state = .off
         captureDarkButton.state = .off
-        ambientEnableSwitch.state = areAmbientRulesEnabled ? .on : .off
-        ambientEnableSwitch.isEnabled = !isComboPolicyEnabled && currentDisplayAmbientProxy != nil &&
+        let targetState: NSControl.StateValue = areAmbientRulesEnabled ? .on : .off
+        if ambientEnableSwitch.state != targetState {
+            log("环境光规则开关状态同步：\(ambientEnableSwitch.state == .on ? "开" : "关") → \(targetState == .on ? "开" : "关")")
+        }
+        ambientEnableSwitch.state = targetState
+        ambientEnableSwitch.isEnabled = isStudioDisplayAvailable && !isComboPolicyEnabled && currentDisplayAmbientProxy != nil &&
             (ambientCloseThreshold != nil || ambientOpenThreshold != nil)
         let currentText = currentDisplayAmbientProxy.map { "当前环境 \($0)" } ?? "当前环境 --"
         if isComboPolicyEnabled {
@@ -2533,7 +2537,6 @@ private final class StatusIndicator: NSObject {
         bindAppButton.isEnabled = enabled
         brightThresholdField.isEnabled = !standby
         darkThresholdField.isEnabled = !standby
-        ambientEnableSwitch.isEnabled = !standby && currentDisplayAmbientProxy != nil
         powerSwitch.isEnabled = enabled
         autoLightSwitch.isEnabled = enabled && !isAmbientPresenceLockActive && !isComboPolicyEnabled
         brightnessSlider.isEnabled = enabled
@@ -3160,7 +3163,6 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
             if lamp.setPower(on: false) {
                 comboPolicyState.lastEnginePowerOffAt = now
                 comboPolicyState.lastPowerWriteAt = now
-                comboPolicyState.smoothedBrightness = nil
                 log("组合策略：Mac 空闲 \(Int(idle / 60)) 分钟且未启用灯体入座检测，关闭 iScreenBar")
             }
         }
@@ -3177,7 +3179,6 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
                 setAmbientLampLock(true)
                 comboPolicyState.lastEnginePowerOffAt = now
                 comboPolicyState.lastPowerWriteAt = now
-                comboPolicyState.smoothedBrightness = nil
                 log("组合策略：在座且环境分数 \(ambient ?? 0) ≥ 明亮关灯点 \(closeThreshold ?? 0) 持续 30 秒，已关闭 iScreenBar")
             }
             statusIndicator.setComboStatus("组合策略 · 环境过亮，已关灯")
@@ -3223,20 +3224,20 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     // 3) 亮度：环境越暗灯越亮，在 [下限, 上限] 之间线性映射，再做平滑限速。
     let brightnessCeiling = min(100, max(1, comboSetting("comboBrightnessMax", 80)))
     let brightnessFloor = min(brightnessCeiling, max(1, comboSetting("comboBrightnessMin", 35)))
-    let lowAnchor = Double(openThreshold ?? 800)
-    let highAnchor = max(lowAnchor + 1, Double(closeThreshold ?? 1400))
-    let ratio = min(1, max(0, (Double(ambient) - lowAnchor) / (highAnchor - lowAnchor)))
+    let mapDark = Double(comboSetting("comboMapDark", 100))
+    let mapBright = max(mapDark + 1, Double(comboSetting("comboMapBright", 1900)))
+    let ratio = min(1, max(0, (Double(ambient) - mapDark) / (mapBright - mapDark)))
     let mapped = Double(brightnessCeiling) - Double(brightnessCeiling - brightnessFloor) * ratio
 
-    let previous = comboPolicyState.smoothedBrightness
-        ?? Double(lamp.currentBrightness ?? Int(mapped.rounded()))
-    // 单次最多变化 8%，避免环境光跳变时亮度阶梯突变造成“闪烁”。
-    let slewed = previous + max(-8, min(8, (mapped - previous) * 0.4))
+    // 从“目标值”起步而非灯体回读值，避免重启或开关后因回读跳变导致亮度一下暗一下亮。
+    let previous = comboPolicyState.smoothedBrightness ?? mapped
+    // 单次最多变化 6%，再乘 0.5 系数，避免环境光跳变时亮度阶梯突变造成“闪烁”。
+    let slewed = previous + max(-6, min(6, (mapped - previous) * 0.5))
     comboPolicyState.smoothedBrightness = slewed
     let appliedBrightness = max(1, min(100, Int(slewed.rounded())))
     let currentBrightness = lamp.currentBrightness ?? appliedBrightness
     if abs(appliedBrightness - currentBrightness) >= 3,
-       now.timeIntervalSince(comboPolicyState.lastBrightnessWriteAt) >= 15,
+       now.timeIntervalSince(comboPolicyState.lastBrightnessWriteAt) >= 6,
        lamp.setBrightness(appliedBrightness) {
         comboPolicyState.lastBrightness = appliedBrightness
         comboPolicyState.lastBrightnessWriteAt = now

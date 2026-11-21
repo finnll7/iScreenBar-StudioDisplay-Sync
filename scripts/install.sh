@@ -17,6 +17,11 @@ label="local.qiu.iScreenBarStudioSync"
 "$script_dir/build.sh"
 
 launchctl bootout "gui/$account_uid/$label" 2>/dev/null || true
+# 等旧进程完全退出，否则新实例会被单实例保护判定为重复运行而直接退出。
+for _ in {1..60}; do
+  pgrep -f iScreenBarStudioSync >/dev/null || break
+  sleep 0.1
+done
 mkdir -p "$user_home_dir/Applications" "$launch_agents_dir" "$logs_dir"
 ditto "$source_app" "$installed_app"
 
