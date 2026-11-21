@@ -7,7 +7,9 @@ account_name=$(id -un)
 account_uid=$(id -u)
 user_home_dir=$(dscl . -read "/Users/$account_name" NFSHomeDirectory | awk '{print $2}')
 source_app="$project_dir/build/iScreen Menu.app"
-installed_app="$user_home_dir/Applications/iScreen Menu.app"
+# 默认装到用户级目录；传 INSTALL_DIR=/Applications 可装进系统应用目录（自动判断是否需要 sudo）。
+install_dir="${INSTALL_DIR:-$user_home_dir/Applications}"
+installed_app="$install_dir/iScreen Menu.app"
 launch_agents_dir="$user_home_dir/Library/LaunchAgents"
 launch_agent="$launch_agents_dir/local.qiu.iScreenBarStudioSync.plist"
 logs_dir="$user_home_dir/Library/Logs"
@@ -25,8 +27,21 @@ done
 # bootout 可能留下孤儿进程，它们会独占 HID 并让新实例退出。
 pkill -f "Contents/MacOS/iScreenBarStudioSync" 2>/dev/null || true
 sleep 0.5
-mkdir -p "$user_home_dir/Applications" "$launch_agents_dir" "$logs_dir"
-ditto "$source_app" "$installed_app"
+mkdir -p "$launch_agents_dir" "$logs_dir"
+if [[ ! -d "$install_dir" ]]; then
+  if [[ "$install_dir" == /Applications ]]; then
+    sudo mkdir -p "$install_dir"
+  else
+    mkdir -p "$install_dir"
+  fi
+fi
+if [[ -w "$install_dir" ]]; then
+  ditto "$source_app" "$installed_app"
+else
+  echo "目标目录需要管理员权限，正在用 sudo 复制到 $install_dir ?"
+  sudo ditto "$source_app" "$installed_app"
+  sudo chown -R "$account_name":staff "$installed_app"
+fi
 
 escaped_executable=${installed_app//&/&amp;}
 escaped_log=${log_file//&/&amp;}
