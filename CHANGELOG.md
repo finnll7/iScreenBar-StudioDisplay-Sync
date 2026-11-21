@@ -4,6 +4,13 @@
 版本号写在 `Info.plist` 的 `CFBundleShortVersionString` / `CFBundleVersion`，面板底部会显示。
 每次发版：更新本文件 → 改 `Info.plist` → `./scripts/install.sh` → 面板核对版本与构建时间。
 
+## 0.3.3 (build 6) — 2026-11-21
+
+调整
+
+- 组合策略亮度默认区间从 80%–35% 调整为 65%–40%，夜间不再那么刺眼；色温曲线保持不变。
+- 新增 `scripts/start.sh` / `scripts/stop.sh`，并在文档中说明应用位于 `~/Applications` 与重新开启的方式。
+
 ## 0.3.2 (build 5) — 2026-11-21
 
 新增
