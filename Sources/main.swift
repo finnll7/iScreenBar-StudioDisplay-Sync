@@ -3164,8 +3164,6 @@ private struct ComboPolicyState {
     var smoothedBrightness: Double?
     var ambientBrightSince: Date?
     var ambientDarkSince: Date?
-    /// 灯是否是 App 因“判为离座”关的：这种灯由 App 在用户回来时重新点亮，固件关的则不插手。
-    var engineClosed = false
 }
 
 private var comboPolicyState = ComboPolicyState()
@@ -3236,27 +3234,23 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     let ambientDark = ambientGateValid && (ambient.flatMap { value in
         openThreshold.map { value <= $0 }
     } ?? false)
-
     // 灯体自动感光会持续覆写亮度，与策略引擎冲突，发现即关闭。
     if lamp.isAutoLightEnabled == true {
         _ = lamp.setAutoLight(enabled: false)
         log("组合策略：已关闭灯体自动感光，改由策略按环境光映射亮度")
     }
 
-    // 1) 入座优先：无人在座时不做任何环境动作，只按需要关灯。
-    //    Mac 空闲达到阈值（默认 10 分钟）即强制判离座——即便灯体入座检测仍认为有人，
-    //    否则固件一旦判错，灯就会一直亮着。未达阈值时由“近期输入”或固件灯态决定。
-    let macIdleOverLimit = idle >= idleLimit
-    // 判在座：Mac 空闲未超阈值即视为在座；超阈值强制离座（不依赖固件怎么想）。
-    let present = !macIdleOverLimit
-    if !present {
+    // 1) 入座优先：开关交给灯体固件，App 只在“灯体入座检测未启用”时才自己判离座。
+    //    这里不做基于 Mac 空闲时间的兼底——否则人回来坐下时固件刚点亮、
+    //    App 用旧的空闲秒数同一轮又把它关掉（实际踩过这个坑）。
+    let presenceOwnsPower = presenceOn
+    if !presenceOwnsPower, !macActive {
         if powerWriteAllowed, !ambientTurnedLampOff, lamp.isPowerOn == true,
            now.timeIntervalSince(comboPolicyState.lastEnginePowerOffAt) > 120 {
             if lamp.setPower(on: false) {
                 comboPolicyState.lastEnginePowerOffAt = now
                 comboPolicyState.lastPowerWriteAt = now
-                comboPolicyState.engineClosed = true
-                log("组合策略：Mac 已空闲 \(Int(idle / 60)) 分钟，判为离座，已关闭 iScreenBar（灯体入座检测=\(presenceOn ? "开" : "关")）")
+                log("组合策略：未启用灯体入座检测且 Mac 已空闲 \(Int(idle / 60)) 分钟，已关闭 iScreenBar")
             }
         }
         statusIndicator.setComboStatus("组合策略 · Mac 空闲 \(Int(idle / 60)) 分钟，判为离座")
@@ -3300,19 +3294,6 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
             statusIndicator.setComboStatus("组合策略 · 环境关灯锁定中，等待变暗")
             return
         }
-        if comboPolicyState.engineClosed {
-            // 这盏灯是 App 因离座关的，回到座位就直接恢复，不等固件。
-            if idle < 5, powerWriteAllowed,
-               now.timeIntervalSince(comboPolicyState.lastEnginePowerOffAt) > 15,
-               lamp.setPower(on: true) {
-                comboPolicyState.engineClosed = false
-                comboPolicyState.lastPowerWriteAt = now
-                log("组合策略：检测到回到座位，恢复 iScreenBar")
-            } else {
-                statusIndicator.setComboStatus("组合策略 · 离座关灯中，等待回来")
-                return
-            }
-        }
         if presenceOn {
             // 入座检测开启时，开灯交给灯体固件（毫秒级响应）；App 不再“补开”，
             // 否则会与固件的离座关灯互相拉扯：固件关、App 开，灯就永远关不掉。
@@ -3328,7 +3309,6 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
         }
     }
 
-    if lamp.isPowerOn == true { comboPolicyState.engineClosed = false }
     guard lamp.isPowerOn == true, let ambient else {
         statusIndicator.setComboStatus(ambient == nil ? "组合策略 · 等待环境光数据" : "组合策略 · 在座，等待开灯条件")
         return

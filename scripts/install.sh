@@ -22,6 +22,9 @@ for _ in {1..60}; do
   pgrep -f iScreenBarStudioSync >/dev/null || break
   sleep 0.1
 done
+# bootout 可能留下孤儿进程，它们会独占 HID 并让新实例退出。
+pkill -f "Contents/MacOS/iScreenBarStudioSync" 2>/dev/null || true
+sleep 0.5
 mkdir -p "$user_home_dir/Applications" "$launch_agents_dir" "$logs_dir"
 ditto "$source_app" "$installed_app"
 
