@@ -1511,6 +1511,18 @@ private final class StatusIndicator: NSObject {
         }
     }
 
+    /// 组合模式用：根据当前是否“需要灯体自己点灯”来启用/停用入座检测，
+    /// 避免固件的自动开灯与“环境充足关灯”互相拆台。
+    func updateFirmwarePresence(requested: Bool) {
+        guard didSyncPresenceSettings, lamp.isConnected else { return }
+        guard lamp.isPresenceDetectionEnabled != requested else { return }
+        if setFirmwarePresenceEnabled(requested) {
+            log(requested
+                ? "已启用灯体入座检测（需要它感知入座/自动点灯）"
+                : "已停用灯体入座检测（无需自动点灯，改用键鼠活动判定）")
+        }
+    }
+
     /// 组合模式用：临时启用/停用灯体入座检测（无人时避免固件误触发点灯）。
     @discardableResult
     func setFirmwarePresenceEnabled(_ enabled: Bool) -> Bool {
@@ -3326,6 +3338,10 @@ var wasConsoleSessionLocked = isConsoleSessionLocked()
 var helperTurnedLampOff = false
 /// 入座唤醒显示器的限速时间戳，避免固件反复点亮时不断发唤醒。
 var lastPresenceWakeAt = Date.distantPast
+/// 上一次观察到的灯体电源状态，用于识别“固件自行点亮”这种入座事件。
+var lastKnownLampPower: Bool?
+/// 最近一次“固件报告有人入座”的时间，短时间内视为有人在座。
+var lastPresenceEventAt = Date.distantPast
 var ambientTurnedLampOff = UserDefaults.standard.bool(forKey: "ambientLampLockActive")
 var ambientCloseCandidateSince: Date?
 var ambientOpenCandidateSince: Date?
@@ -3382,7 +3398,6 @@ private struct ComboPolicyState {
     var lastEnginePowerOffAt = Date.distantPast
     var lastPowerWriteAt = Date.distantPast
     var didWarnThresholdOverlap = false
-    var firmwarePresenceSuppressed = false
     /// 平滑后的目标亮度，避免环境光跳变时亮度阶梯突变造成“闪烁”。
     var smoothedBrightness: Double?
     var ambientBrightSince: Date?
@@ -3431,7 +3446,6 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     // 离座判定阈值：固件实测约 3 分钟才关灯，所以默认用 App 侧 90 秒兼底。
     let idleLimit = TimeInterval(comboSetting("comboIdleSeconds", 600))
     let macActive = idle < idleLimit
-    let macIdleOverLimit = !macActive
     let now = Date()
     // 等待首次状态回读，避免启动瞬间因电源状态未知而多写一次。
     guard lamp.isPowerOn != nil else {
@@ -3448,16 +3462,10 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     }
 
     // === 优先级：入座 → 屏幕 → 环境光 ===
-    // 1) 入座优先级最高：Mac 键鼠空闲超阈值即判无人，灯必须灭（即使固件误判有人）。
-    let present = !macIdleOverLimit
+    // 1) 入座最高优先级：有人 = 近期键鼠活动 或 灯体刚报告“有人入座”（3 分钟内有效）。
+    let presenceRecent = now.timeIntervalSince(lastPresenceEventAt) < 1800
+    let present = macActive || presenceRecent
     if !present {
-        // 固件入座检测在无人时会误触发并自行点灯，这里临时停用，等人回来再恢复。
-        if !comboPolicyState.firmwarePresenceSuppressed, lamp.isPresenceDetectionEnabled == true {
-            if statusIndicator.setFirmwarePresenceEnabled(false) {
-                comboPolicyState.firmwarePresenceSuppressed = true
-                log("组合策略：判为无人，已暂停灯体入座检测，避免灯被自行点亮")
-            }
-        }
         if powerWriteAllowed, lamp.isPowerOn == true,
            now.timeIntervalSince(comboPolicyState.lastEnginePowerOffAt) > 30 {
             if lamp.setPower(on: false) {
@@ -3468,12 +3476,6 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
         }
         statusIndicator.setComboStatus("组合策略 · 无人（Mac 空闲 \(Int(idle / 60)) 分钟）")
         return
-    }
-    if comboPolicyState.firmwarePresenceSuppressed {
-        if statusIndicator.setFirmwarePresenceEnabled(true) {
-            comboPolicyState.firmwarePresenceSuppressed = false
-            log("组合策略：检测到有人，已恢复灯体入座检测")
-        }
     }
 
     // 2) 有人但屏幕未唤醒：默认不点灯（引擎已在 isAsleep 时提前返回）。
@@ -3603,8 +3605,8 @@ private func pollDisplayAndLamp() {
     let brightnessFollowEnabled = statusIndicator.isBrightnessFollowEnabled
     let displayBrightnessLockEnabled = statusIndicator.isDisplayBrightnessLockEnabled
     let powerSyncEnabled = statusIndicator.isPowerSyncEnabled
-    // 熄屏时是否保留入座检测、允许“入座→唤醒屏幕”（默认关闭：现在入座一律以键鼠活动判定）。
-    let presenceWakesDisplay = comboSetting("presenceWakesDisplay", 0) == 1
+    // 熄屏时是否保留入座检测、允许“入座→唤醒屏幕”（默认开启：有人入座通常就是要用显示器）。
+    let presenceWakesDisplay = comboSetting("presenceWakesDisplay", 1) == 1
     let ambientLinkEnabled = statusIndicator.isAmbientLinkEnabled
     let comboEnabled = statusIndicator.isComboPolicyEnabled
     let ambientCloseThreshold = statusIndicator.ambientCloseThreshold
@@ -3639,6 +3641,23 @@ private func pollDisplayAndLamp() {
         }
     }
 
+    // 固件自行点亮灯 = 检测到有人入座：记为入座事件（最多 3 分钟内有效），供唤醒与占用判定使用。
+    if let power = lamp.isPowerOn {
+        if lastKnownLampPower == false, power == true,
+           Date().timeIntervalSince(comboPolicyState.lastPowerWriteAt) > 3 {
+            lastPresenceEventAt = Date()
+            log("灯体自行点亮：视为检测到入座")
+        }
+        lastKnownLampPower = power
+    }
+
+    // 动态管理灯体入座检测：只在“需要它自动点灯”时开启，避免与环境充足关灯互相拉扯。
+    let ambientEnoughForLamp = displayAmbientProxy.flatMap { value in
+        statusIndicator.ambientCloseThreshold.map { value >= $0 }
+    } ?? false
+    let wantFirmwarePresence = isAsleep || !ambientEnoughForLamp || lamp.isPowerOn == true
+    statusIndicator.updateFirmwarePresence(requested: wantFirmwarePresence)
+
     // 熄屏同步是最高优先级：屏幕熄灭期间，环境光、入座检测或灯体自身逻辑
     // 都不得重新点亮灯。持续检测可覆盖灯体在熄屏后中途自行亮起的情况。
     if powerSyncEnabled, isAsleep {
@@ -3647,12 +3666,13 @@ private func pollDisplayAndLamp() {
             // 但要求 Mac 近期有操作，否则整夜无人时也会被固件误检点亮并唤醒屏幕。
             if lamp.isPowerOn == true {
                 let macIdle = systemIdleSeconds()
-                if macIdle < 300, Date().timeIntervalSince(lastPresenceWakeAt) > 30 {
+                // 只在“最近 2 小时内用过电脑”时接受入座唤醒，避免整夜无人时被误检叫醒屏幕。
+                if macIdle < 7200, Date().timeIntervalSince(lastPresenceWakeAt) > 30 {
                     lastPresenceWakeAt = Date()
                     helperTurnedLampOff = false
                     let woke = requestSystemDisplayWake()
                     log(woke ? "检测到入座：灯体已点亮，已唤醒显示器" : "检测到入座：但唤醒显示器请求失败")
-                } else if macIdle >= 300 {
+                } else if macIdle >= 7200 {
                     if lamp.setPower(on: false) {
                         helperTurnedLampOff = true
                         log("忽略入座信号：Mac 已空闲 \(Int(macIdle / 60)) 分钟，判为固件误检，已关灯")
