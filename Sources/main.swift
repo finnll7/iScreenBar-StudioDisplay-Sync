@@ -3358,6 +3358,8 @@ var lastPresenceWakeAt = Date.distantPast
 var lastKnownLampPower: Bool?
 /// 最近一次“固件报告有人入座”的时间，短时间内视为有人在座。
 var lastPresenceEventAt = Date.distantPast
+/// 灯体自行熄灭（离座）的时间：短时间内 App 不再自动补开，避免“刚关又开”。
+var lastFirmwareOffAt = Date.distantPast
 /// 入座检测启停去抖：期望状态、变更时间与上次下发时间。
 var lastPresenceDesire: Bool?
 var presenceDesireSince = Date()
@@ -3533,8 +3535,10 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     }
 
     // 4) 有人 + 环境不足 → 点灯（持续 10 秒确认）
+    //    刚被固件判定离座而关灯时，5 分钟内不补开（除非用户正在活跃输入），否则会变成“关→开”反复。
+    let reopenAllowed = idle < 60 || now.timeIntervalSince(lastFirmwareOffAt) > 300
     if lamp.isPowerOn != true {
-        if let ambient, Double(ambient) <= Double(ambientOnThreshold) {
+        if let ambient, Double(ambient) <= Double(ambientOnThreshold), reopenAllowed {
             if comboPolicyState.ambientDarkSince == nil { comboPolicyState.ambientDarkSince = now }
             if let since = comboPolicyState.ambientDarkSince, now.timeIntervalSince(since) >= 10,
                powerWriteAllowed, lamp.setPower(on: true) {
@@ -3687,12 +3691,15 @@ private func pollDisplayAndLamp() {
         }
     }
 
-    // 固件自行点亮灯 = 检测到有人入座：记为入座事件（最多 3 分钟内有效），供唤醒与占用判定使用。
+    // 固件自行点亮/熄灭：前者=检测到入座，后者=判定离座（此时 App 不应“补开”）。
     if let power = lamp.isPowerOn {
-        if lastKnownLampPower == false, power == true,
-           Date().timeIntervalSince(comboPolicyState.lastPowerWriteAt) > 3 {
+        let externalChange = Date().timeIntervalSince(comboPolicyState.lastPowerWriteAt) > 3
+        if lastKnownLampPower == false, power == true, externalChange {
             lastPresenceEventAt = Date()
             log("灯体自行点亮：视为检测到入座")
+        } else if lastKnownLampPower == true, power == false, externalChange {
+            lastFirmwareOffAt = Date()
+            log("灯体自行熄灭：判定为离座（App 在 5 分钟内不会自动补开）")
         }
         lastKnownLampPower = power
     }
