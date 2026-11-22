@@ -6,10 +6,10 @@ project_dir=${script_dir:h}
 account_name=$(id -un)
 account_uid=$(id -u)
 user_home_dir=$(dscl . -read "/Users/$account_name" NFSHomeDirectory | awk '{print $2}')
-source_app="$project_dir/build/iScreen Menu.app"
+source_app="$project_dir/build/iScreenBar Menu.app"
 # 默认装到用户级目录；传 INSTALL_DIR=/Applications 可装进系统应用目录（自动判断是否需要 sudo）。
 install_dir="${INSTALL_DIR:-$user_home_dir/Applications}"
-installed_app="$install_dir/iScreen Menu.app"
+installed_app="$install_dir/iScreenBar Menu.app"
 launch_agents_dir="$user_home_dir/Library/LaunchAgents"
 launch_agent="$launch_agents_dir/local.qiu.iScreenBarStudioSync.plist"
 logs_dir="$user_home_dir/Library/Logs"
@@ -34,6 +34,15 @@ if [[ ! -d "$install_dir" ]]; then
   else
     mkdir -p "$install_dir"
   fi
+fi
+legacy_app="$install_dir/iScreen Menu.app"
+if [[ -d "$legacy_app" ]]; then
+  if [[ -w "$install_dir" ]]; then rm -rf "$legacy_app"; else sudo rm -rf "$legacy_app"; fi
+  echo "已删除旧名称副本：$legacy_app"
+fi
+# 目标已存在但属主不是当前用户时，先清掉再复制
+if [[ -d "$installed_app" && ! -w "$installed_app" ]]; then
+  sudo rm -rf "$installed_app"
 fi
 if [[ -w "$install_dir" ]]; then
   ditto "$source_app" "$installed_app"
@@ -65,5 +74,5 @@ escaped_log=${log_file//&/&amp;}
 plutil -lint "$launch_agent"
 launchctl bootstrap "gui/$account_uid" "$launch_agent"
 
-echo "iScreen Menu 已安装并启动，请从菜单栏打开。"
+echo "iScreenBar Menu 已安装并启动，请从菜单栏打开。"
 echo "Log: $log_file"

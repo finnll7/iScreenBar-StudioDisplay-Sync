@@ -199,7 +199,7 @@ struct GlassPanelView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("iScreen Menu")
+            Text("iScreenBar Menu")
                 .font(.system(size: 17, weight: .semibold))
             Text("屏幕与灯光控制")
                 .font(.system(size: 11))

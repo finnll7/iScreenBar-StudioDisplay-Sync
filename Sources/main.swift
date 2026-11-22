@@ -857,7 +857,7 @@ private final class StatusIndicator: NSObject {
             let temperatureText = healthy ? lamp.currentTemperature.map { "\($0)K" } ?? "----K" : "----K"
             item.button?.toolTip = "\(brightnessText) · \(temperatureText)"
         }
-        item.button?.setAccessibilityLabel("iScreen Menu \(status)")
+        item.button?.setAccessibilityLabel("iScreenBar \(status)")
         if displayController.isStudioCovered,
            (displayController.studioTarget() == nil || isConsoleSessionLocked()) {
             _ = displayController.setStudioEnabled(true)

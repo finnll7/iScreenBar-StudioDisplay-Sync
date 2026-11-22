@@ -1,129 +1,109 @@
 import AppKit
 import Foundation
 
-// 玻璃风图标：上方护眼灯条照亮显示器，一眼可读为“屏幕灯控制”
+// 参考官方视觉语言重绘：深色圆角底 + 顶部灯条 + 柔和扩散的暖→冷光
 let size = 1024.0
 let image = NSImage(size: NSSize(width: size, height: size))
 image.lockFocus()
 guard let context = NSGraphicsContext.current?.cgContext else { exit(1) }
 
 let bounds = CGRect(x: 0, y: 0, width: size, height: size)
-let rounded = CGPath(roundedRect: bounds.insetBy(dx: 26, dy: 26), cornerWidth: 216, cornerHeight: 216, transform: nil)
+let rounded = CGPath(roundedRect: bounds.insetBy(dx: 24, dy: 24), cornerWidth: 220, cornerHeight: 220, transform: nil)
 
-func gradient(_ colors: [NSColor], _ locations: [CGFloat]) -> CGGradient {
+func grad(_ colors: [NSColor], _ locations: [CGFloat]) -> CGGradient {
     CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
                colors: colors.map { $0.cgColor } as CFArray,
                locations: locations)!
 }
 
-// 底色：冷调玻璃渐变
+func radial(_ colors: [NSColor], _ locations: [CGFloat], center: CGPoint, radius: CGFloat, scaleY: CGFloat = 1) {
+    context.saveGState()
+    context.translateBy(x: center.x, y: center.y)
+    context.scaleBy(x: 1, y: scaleY)
+    context.drawRadialGradient(grad(colors, locations),
+                               startCenter: .zero, startRadius: 0,
+                               endCenter: .zero, endRadius: radius,
+                               options: [])
+    context.restoreGState()
+}
+
 context.saveGState()
 context.addPath(rounded)
 context.clip()
+
+// 1) 深色底
 context.drawLinearGradient(
-    gradient([NSColor(srgbRed: 0.40, green: 0.55, blue: 0.88, alpha: 0.95),
-              NSColor(srgbRed: 0.14, green: 0.21, blue: 0.40, alpha: 0.98),
-              NSColor(srgbRed: 0.06, green: 0.08, blue: 0.17, alpha: 1.0)],
-             [0, 0.58, 1]),
-    start: CGPoint(x: size * 0.08, y: size),
-    end: CGPoint(x: size * 0.95, y: 0),
-    options: []
+    grad([NSColor(white: 0.13, alpha: 1), NSColor(white: 0.06, alpha: 1), NSColor(white: 0.02, alpha: 1)],
+         [0, 0.5, 1]),
+    start: CGPoint(x: size * 0.5, y: size), end: CGPoint(x: size * 0.5, y: 0), options: []
 )
-context.restoreGState()
 
-let screen = CGRect(x: 148, y: 236, width: 728, height: 424)
-let lamp = CGRect(x: 300, y: 726, width: 424, height: 58)
+// 2) 主光池：从灯条向下柔和扩散（椭圆径向渐变，没有硬边）
+radial([NSColor(white: 1.0, alpha: 0.92),
+        NSColor(white: 1.0, alpha: 0.42),
+        NSColor(white: 1.0, alpha: 0.0)],
+       [0, 0.5, 1],
+       center: CGPoint(x: size * 0.5, y: size * 0.46),
+       radius: size * 0.56,
+       scaleY: 1.05)
 
-// 灯条柔光（先画，位于灯条与屏幕之间）
+// 2b) 灯条正下方的窄光斑，让光源与光圈连起来
+radial([NSColor(white: 1.0, alpha: 0.85), NSColor(white: 1.0, alpha: 0.0)], [0, 1],
+       center: CGPoint(x: size * 0.5, y: size * 0.74), radius: size * 0.30, scaleY: 0.75)
+
+// 3) 左侧暖色
+radial([NSColor(srgbRed: 1.0, green: 0.78, blue: 0.38, alpha: 0.80),
+        NSColor(srgbRed: 1.0, green: 0.76, blue: 0.36, alpha: 0.0)],
+       [0, 1],
+       center: CGPoint(x: size * 0.34, y: size * 0.34),
+       radius: size * 0.36,
+       scaleY: 1.25)
+
+// 4) 右侧冷色
+radial([NSColor(srgbRed: 0.70, green: 0.84, blue: 1.0, alpha: 0.82),
+        NSColor(srgbRed: 0.70, green: 0.84, blue: 1.0, alpha: 0.0)],
+       [0, 1],
+       center: CGPoint(x: size * 0.66, y: size * 0.32),
+       radius: size * 0.36,
+       scaleY: 1.25)
+
+// 5) 顶部压暗，让灯条区域更聚焦
+context.drawLinearGradient(
+    grad([NSColor(white: 0, alpha: 0.85), NSColor(white: 0, alpha: 0.35), NSColor(white: 0, alpha: 0.0)], [0, 0.55, 1]),
+    start: CGPoint(x: 0, y: size), end: CGPoint(x: 0, y: size * 0.62), options: []
+)
+
+// 6) 灯条（亮白胶囊 + 强光晕）
+let lampWidth = size * 0.46
+let lampHeight = size * 0.028
+let lampRect = CGRect(x: (size - lampWidth) / 2, y: size * 0.795, width: lampWidth, height: lampHeight)
+let lampPath = CGPath(roundedRect: lampRect, cornerWidth: lampHeight / 2, cornerHeight: lampHeight / 2, transform: nil)
 context.saveGState()
-context.addPath(rounded)
-context.clip()
-context.drawRadialGradient(
-    gradient([NSColor(srgbRed: 1.0, green: 0.86, blue: 0.58, alpha: 0.55),
-              NSColor(srgbRed: 1.0, green: 0.80, blue: 0.45, alpha: 0.0)], [0, 1]),
-    startCenter: CGPoint(x: size * 0.5, y: lamp.minY), startRadius: 20,
-    endCenter: CGPoint(x: size * 0.5, y: lamp.minY), endRadius: size * 0.46,
-    options: []
-)
-context.restoreGState()
-
-// 显示器本体
-let bodyPath = CGPath(roundedRect: screen, cornerWidth: 54, cornerHeight: 54, transform: nil)
-context.addPath(bodyPath)
-context.setFillColor(NSColor(srgbRed: 0.05, green: 0.07, blue: 0.14, alpha: 1).cgColor)
+context.setShadow(offset: .zero, blur: 90, color: NSColor(white: 1, alpha: 0.95).cgColor)
+context.addPath(lampPath)
+context.setFillColor(NSColor(white: 1, alpha: 1).cgColor)
 context.fillPath()
+context.restoreGState()
 
-// 屏幕面：顶部受光、越往下越暗
-let panel = screen.insetBy(dx: 24, dy: 24)
-let panelPath = CGPath(roundedRect: panel, cornerWidth: 36, cornerHeight: 36, transform: nil)
+// 7) 灯条上方很淡的机壳反光（暗示这是灯条而非一条白线）
+let housing = CGRect(x: lampRect.minX - size * 0.01, y: lampRect.maxY + size * 0.004, width: lampRect.width + size * 0.02, height: size * 0.075)
 context.saveGState()
-context.addPath(panelPath)
+context.addPath(CGPath(roundedRect: housing, cornerWidth: size * 0.035, cornerHeight: size * 0.035, transform: nil))
 context.clip()
 context.drawLinearGradient(
-    gradient([NSColor(srgbRed: 1.0, green: 0.90, blue: 0.66, alpha: 0.95),
-              NSColor(srgbRed: 0.55, green: 0.66, blue: 0.92, alpha: 0.55),
-              NSColor(srgbRed: 0.06, green: 0.08, blue: 0.17, alpha: 1.0)],
-             [0, 0.32, 1]),
-    start: CGPoint(x: size * 0.5, y: panel.maxY),
-    end: CGPoint(x: size * 0.5, y: panel.minY),
-    options: []
+    grad([NSColor(white: 0.30, alpha: 0.85), NSColor(white: 0.22, alpha: 0.55), NSColor(white: 0.16, alpha: 0.0)],
+         [0, 0.5, 1]),
+    start: CGPoint(x: 0, y: housing.maxY), end: CGPoint(x: 0, y: housing.minY), options: []
 )
 context.restoreGState()
 
-// 顶部受光衰减（柔和光斑，不用硬边白条）
-context.saveGState()
-context.addPath(panelPath)
-context.clip()
-context.drawLinearGradient(
-    gradient([NSColor(white: 1, alpha: 0.42), NSColor(white: 1, alpha: 0.0)], [0, 1]),
-    start: CGPoint(x: size * 0.5, y: panel.maxY),
-    end: CGPoint(x: size * 0.5, y: panel.maxY - panel.height * 0.55),
-    options: []
-)
-context.restoreGState()
-
-// 玻璃外框高光
-context.saveGState()
-context.addPath(bodyPath)
-context.setStrokeColor(NSColor(white: 1, alpha: 0.62).cgColor)
-context.setLineWidth(14)
+// 8) 外层玻璃边
+context.addPath(rounded)
+context.setStrokeColor(NSColor(white: 1, alpha: 0.10).cgColor)
+context.setLineWidth(4)
 context.strokePath()
-context.restoreGState()
 
-// 灯条：亮胶囊 + 强光晕
-context.saveGState()
-context.setShadow(offset: CGSize(width: 0, height: -14), blur: 80, color: NSColor(srgbRed: 1, green: 0.85, blue: 0.54, alpha: 1).cgColor)
-context.addPath(CGPath(roundedRect: lamp, cornerWidth: 29, cornerHeight: 29, transform: nil))
-context.setFillColor(NSColor(srgbRed: 1.0, green: 0.96, blue: 0.85, alpha: 1).cgColor)
-context.fillPath()
 context.restoreGState()
-context.saveGState()
-context.addPath(CGPath(roundedRect: lamp, cornerWidth: 29, cornerHeight: 29, transform: nil))
-context.clip()
-context.drawLinearGradient(
-    gradient([NSColor(white: 1, alpha: 0.95), NSColor(srgbRed: 1, green: 0.82, blue: 0.50, alpha: 1)], [0, 1]),
-    start: CGPoint(x: 0, y: lamp.maxY), end: CGPoint(x: 0, y: lamp.minY), options: []
-)
-context.restoreGState()
-
-// 支架与底座
-let stem = CGRect(x: 470, y: 176, width: 84, height: 62)
-context.addPath(CGPath(roundedRect: stem, cornerWidth: 16, cornerHeight: 16, transform: nil))
-context.setFillColor(NSColor(white: 1, alpha: 0.38).cgColor)
-context.fillPath()
-let base = CGRect(x: 348, y: 118, width: 328, height: 32)
-context.addPath(CGPath(roundedRect: base, cornerWidth: 16, cornerHeight: 16, transform: nil))
-context.setFillColor(NSColor(white: 1, alpha: 0.44).cgColor)
-context.fillPath()
-
-// 玻璃外圈
-context.saveGState()
-context.addPath(rounded)
-context.setStrokeColor(NSColor(white: 1, alpha: 0.40).cgColor)
-context.setLineWidth(6)
-context.strokePath()
-context.restoreGState()
-
 image.unlockFocus()
 
 guard let tiff = image.tiffRepresentation,

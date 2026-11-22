@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir=${0:A:h}
 project_dir=${script_dir:h}
 build_dir="$project_dir/build"
-app_dir="$build_dir/iScreen Menu.app"
+app_dir="$build_dir/iScreenBar Menu.app"
 executable_dir="$app_dir/Contents/MacOS"
 
 mkdir -p "$executable_dir"
