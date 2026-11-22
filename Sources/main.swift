@@ -4,6 +4,7 @@ import Darwin
 import Foundation
 import IOKit.hid
 import ObjectiveC.runtime
+import SwiftUI
 import UniformTypeIdentifiers
 
 private let benqVendorID = 0x04A5
@@ -17,6 +18,45 @@ private func log(_ message: String) {
     print("[\(formatter.string(from: Date()))] \(message)")
     fflush(stdout)
 }
+
+/// 版本与构建时间（从 bundle 读取，发版时只改 Info.plist）。
+private func appVersionText() -> String {
+    let info = Bundle.main.infoDictionary
+    let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+    let build = info?["CFBundleVersion"] as? String ?? "?"
+    var stamp = "—"
+    if let url = Bundle.main.executableURL,
+       let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM-dd HH:mm"
+        stamp = formatter.string(from: date)
+    }
+    return "v\(short) (\(build)) · 构建 \(stamp)"
+}
+
+/// 两个实例同时写同一个灯体会造成开关抖动，因此只保留先启动的实例。
+/// 重装时旧进程可能尚未回收，先短暂等待，避免把刚启动的新实例误杀。
+private func enforceSingleInstance() {
+    let me = ProcessInfo.processInfo.processIdentifier
+    let identifier = Bundle.main.bundleIdentifier ?? "local.qiu.iScreenBarStudioSync"
+    func otherInstance() -> NSRunningApplication? {
+        return NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
+            .first { $0.processIdentifier != me && !$0.isTerminated }
+    }
+    for attempt in 0..<80 {
+        guard let other = otherInstance() else { return }
+        if attempt == 0 {
+            log("检测到已有实例在运行：pid \(other.processIdentifier) 路径 \(other.bundleURL?.path ?? "未知")，等待其退出")
+        }
+        Thread.sleep(forTimeInterval: 0.1)
+    }
+    if let other = otherInstance() {
+        log("已有实例持续运行中（pid \(other.processIdentifier) 路径 \(other.bundleURL?.path ?? "未知")），本实例退出以免重复写灯体")
+        exit(0)
+    }
+}
+
+enforceSingleInstance()
 
 private let activeControlColor = NSColor.controlAccentColor
 
@@ -87,6 +127,8 @@ private final class HighlightSliderCell: NSSliderCell {
 private final class InteractiveSlider: NSSlider {
     private let activeColor: NSColor
     private let highlightCell: HighlightSliderCell
+    /// 拖动开始/结束回调，用于在拖动期间实显数值与限速下发。
+    var onTrackingChanged: ((Bool) -> Void)?
 
     init(value: Double, minValue: Double, maxValue: Double, activeColor: NSColor) {
         self.activeColor = activeColor
@@ -103,6 +145,7 @@ private final class InteractiveSlider: NSSlider {
     required init?(coder: NSCoder) { nil }
 
     override func mouseDown(with event: NSEvent) {
+        onTrackingChanged?(true)
         highlightCell.isInteracting = true
         needsDisplay = true
         NSAnimationContext.runAnimationGroup { context in
@@ -116,6 +159,7 @@ private final class InteractiveSlider: NSSlider {
             context.duration = 0.18
             layer?.backgroundColor = NSColor.clear.cgColor
         }
+        onTrackingChanged?(false)
     }
 }
 
@@ -163,7 +207,10 @@ private final class FeatureButton: NSButton {
     required init?(coder: NSCoder) { nil }
 
     override var state: NSControl.StateValue {
-        didSet { updateAppearance() }
+        didSet {
+            guard oldValue != state else { return }
+            updateAppearance()
+        }
     }
 
     override func updateLayer() {
@@ -329,11 +376,18 @@ private final class AccentSwitch: NSButton {
     override var intrinsicContentSize: NSSize { NSSize(width: 38, height: 22) }
 
     override var state: NSControl.StateValue {
-        didSet { updateAppearance(animated: window != nil) }
+        didSet {
+            // 面板每 250ms 刷新一次状态；值未变时不重启动画，否则会持续闪炼。
+            guard oldValue != state else { return }
+            updateAppearance(animated: window != nil)
+        }
     }
 
     override var isEnabled: Bool {
-        didSet { updateAppearance(animated: false) }
+        didSet {
+            guard oldValue != isEnabled else { return }
+            updateAppearance(animated: false)
+        }
     }
 
     override func layout() {
@@ -616,6 +670,8 @@ private final class DisplayController {
 
 private final class StatusIndicator: NSObject {
     private let presenceDelayOptions = [180, 300, 600]
+    private let readingModeBrightness = 70
+    private let readingModeTemperature = 4200
     private let item: NSStatusItem
     private let lamp: LampController
     private let popover = NSPopover()
@@ -640,12 +696,16 @@ private final class StatusIndicator: NSObject {
     private let displayBrightnessLockSwitch = FeatureButton(title: "双屏亮度", symbol: "rectangle.on.rectangle", accentColor: activeControlColor)
     private let powerSyncSwitch = FeatureButton(title: "熄屏同步", symbol: "moon.zzz", accentColor: activeControlColor)
     private let keepAwakeSwitch = FeatureButton(title: "防止休眠", symbol: "cup.and.saucer", accentColor: activeControlColor)
+    private let readingModeSwitch = FeatureButton(title: "阅读模式", symbol: "book", accentColor: .systemGreen)
+    private let comboPolicySwitch = FeatureButton(title: "智能组合", symbol: "wand.and.stars", accentColor: .systemPurple)
+    private let comboStatusLabel = NSTextField(labelWithString: "")
+    private let versionLabel = NSTextField(labelWithString: "")
     private let keepAwakeController = KeepAwakeController()
     private let captureBrightButton = FeatureButton(title: "明亮关灯", symbol: "sun.max.fill", accentColor: .systemOrange)
     private let captureDarkButton = FeatureButton(title: "昏暗开灯", symbol: "moon.fill", accentColor: .systemBlue)
     private let ambientEnableSwitch = AccentSwitch()
-    private let brightThresholdLabel = NSTextField(labelWithString: "--")
-    private let darkThresholdLabel = NSTextField(labelWithString: "--")
+    private let brightThresholdField = StatusIndicator.thresholdField()
+    private let darkThresholdField = StatusIndicator.thresholdField()
     private let ambientStatusLabel = NSTextField(labelWithString: "尚未完成环境标定")
     private let displayPowerSwitch: FeatureButton = {
         let button = FeatureButton(title: "内屏", symbol: "display", accentColor: activeControlColor)
@@ -660,6 +720,10 @@ private final class StatusIndicator: NSObject {
     private(set) var isDisplayBrightnessLockEnabled: Bool
     private(set) var isPowerSyncEnabled: Bool
     private(set) var isTimeTemperatureEnabled: Bool
+    private(set) var isReadingModeEnabled: Bool
+    private(set) var isComboPolicyEnabled: Bool
+    /// 手动调过灯后的一段时间内，策略引擎不覆写用户设置。
+    var comboManualOverrideUntil = Date.distantPast
     private(set) var ambientCloseThreshold: Int?
     private(set) var ambientOpenThreshold: Int?
     private(set) var currentDisplayAmbientProxy: Int?
@@ -667,7 +731,14 @@ private final class StatusIndicator: NSObject {
     private var ambientThresholdSource: String?
     private var areAmbientRulesEnabled: Bool
     private var isDisplayAutoPresetEnabled: Bool
+    private var didSyncPresenceSettings = false
+    /// 入座检测是否被策略临时停用（面板需要提示，避免看起来像故障）。
+    private(set) var isPresenceSuspendedByPolicy = false
+    private let panelModel = PanelModel()
+    private var glassHostController: NSViewController?
     private var isHealthy = true
+    private var isStudioDisplayAvailable = false
+    private let standbyLabel = NSTextField(labelWithString: "未检测到 Studio Display，功能待机")
     private var isAsleep: Bool
     private var autoLightChangePendingUntil: Date?
     private var pendingAutoLightState: Bool?
@@ -684,6 +755,17 @@ private final class StatusIndicator: NSObject {
     private var pendingDisplayPolicyWorkItem: DispatchWorkItem?
     private var pendingBuiltinWakeWorkItems: [DispatchWorkItem] = []
     private var didRequestDisplaySleepForCurrentLidClosure = false
+    /// 点采集按钮后短暂忽略输入框结束编辑的回写，避免旧文本覆盖新采集值。
+    private var thresholdCommitSuppressedUntil = Date.distantPast
+    /// 滑块拖动中的实时数值与限速写入状态。
+    private var isBrightnessSliderTracking = false
+    private var isTemperatureSliderTracking = false
+    private var lastSliderWriteAt = Date.distantPast
+    private var pendingBrightnessValue: Int?
+    private var pendingTemperatureValue: Int?
+
+    /// 用户正在拖滑块时，策略引擎不覆写亮度色温。
+    var isUserAdjustingLamp: Bool { isBrightnessSliderTracking || isTemperatureSliderTracking }
 
     private var isBuiltinManuallyDisabled: Bool {
         get { UserDefaults.standard.bool(forKey: "builtinManuallyDisabled") }
@@ -697,11 +779,18 @@ private final class StatusIndicator: NSObject {
         isDisplayBrightnessLockEnabled = UserDefaults.standard.bool(forKey: "displayBrightnessLockEnabled")
         isPowerSyncEnabled = UserDefaults.standard.object(forKey: "powerSyncEnabled") as? Bool ?? true
         isTimeTemperatureEnabled = UserDefaults.standard.bool(forKey: "timeTemperatureEnabled")
+        isReadingModeEnabled = UserDefaults.standard.bool(forKey: "readingModeEnabled")
+        isComboPolicyEnabled = UserDefaults.standard.bool(forKey: "comboPolicyEnabled")
         ambientCloseThreshold = UserDefaults.standard.object(forKey: "ambientCloseThreshold") as? Int
         ambientOpenThreshold = UserDefaults.standard.object(forKey: "ambientOpenThreshold") as? Int
         ambientThresholdSource = UserDefaults.standard.string(forKey: "ambientThresholdSource")
         areAmbientRulesEnabled = UserDefaults.standard.object(forKey: "ambientRulesEnabled") as? Bool
             ?? (ambientCloseThreshold != nil || ambientOpenThreshold != nil)
+        // 组合模式下旧环境光规则由策略引擎接管，避免两套逻辑同时写电源。
+        if isComboPolicyEnabled, areAmbientRulesEnabled {
+            areAmbientRulesEnabled = false
+            UserDefaults.standard.set(false, forKey: "ambientRulesEnabled")
+        }
         UserDefaults.standard.removeObject(forKey: "ambientLinkEnabled")
         if ambientThresholdSource != "studioDisplayALS-v1" {
             ambientCloseThreshold = nil
@@ -731,6 +820,7 @@ private final class StatusIndicator: NSObject {
         item.button?.action = #selector(togglePanel)
         migrateDisplayPresetIfNeeded()
         configurePanel()
+        installGlassPanel()
         NotificationCenter.default.addObserver(self, selector: #selector(applicationWillTerminate),
                                                name: NSApplication.willTerminateNotification, object: nil)
         let workspaceNotifications = NSWorkspace.shared.notificationCenter
@@ -760,12 +850,16 @@ private final class StatusIndicator: NSObject {
         let displayState = isAsleep ? "Studio Display 已熄屏" : "Studio Display 已唤醒"
         let brightnessStatus = isBrightnessFollowEnabled ? "亮度跟随已开启" : "亮度跟随已关闭"
         let powerStatus = isPowerSyncEnabled ? "熄屏同步已开启" : "熄屏同步已关闭"
-        let status = healthy ? "同步正常" : "同步异常"
+        let status = isStudioDisplayAvailable ? (healthy ? "同步正常" : "同步异常") : "待机"
         _ = (displayState, brightnessStatus, powerStatus)
-        let brightnessText = healthy ? lamp.currentBrightness.map { "\($0)%" } ?? "--%" : "--%"
-        let temperatureText = healthy ? lamp.currentTemperature.map { "\($0)K" } ?? "----K" : "----K"
-        item.button?.toolTip = "\(brightnessText) · \(temperatureText)"
-        item.button?.setAccessibilityLabel("iScreen Menu \(status)")
+        if !isStudioDisplayAvailable {
+            item.button?.toolTip = "待机 · 未连接 Studio Display"
+        } else {
+            let brightnessText = healthy ? lamp.currentBrightness.map { "\($0)%" } ?? "--%" : "--%"
+            let temperatureText = healthy ? lamp.currentTemperature.map { "\($0)K" } ?? "----K" : "----K"
+            item.button?.toolTip = "\(brightnessText) · \(temperatureText)"
+        }
+        item.button?.setAccessibilityLabel("iScreenBar \(status)")
         if displayController.isStudioCovered,
            (displayController.studioTarget() == nil || isConsoleSessionLocked()) {
             _ = displayController.setStudioEnabled(true)
@@ -778,48 +872,101 @@ private final class StatusIndicator: NSObject {
         if popover.isShown {
             popover.performClose(nil)
         } else {
-            lamp.requestStatus()
+            if isStudioDisplayAvailable { lamp.requestStatus() }
             refreshControls()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
     }
 
+    /// 仅当 Apple 厂商 + Studio Display 型号均匹配时启用全部功能，否则保持常驻待机。
+    func setStudioDisplayAvailable(_ available: Bool) {
+        guard isStudioDisplayAvailable != available else { return }
+        isStudioDisplayAvailable = available
+        updateIcon(healthy: isHealthy)
+        if popover.isShown { refreshControls() }
+        log(available ? "已识别 Studio Display，功能启用" : "未检测到 Studio Display，功能进入待机")
+    }
+
     @objc private func powerChanged() {
         let requested = powerSwitch.state == .on
+        markManualOverride(seconds: 1800)
         if !lamp.setPower(on: requested) { powerSwitch.state = requested ? .off : .on }
         updateIcon(healthy: isHealthy && lamp.isConnected)
         lamp.requestStatus()
     }
 
     @objc private func captureBrightThreshold() {
+        // 先结束正在进行的输入，再采集：保证采集值最终生效，不被旧文本回写。
+        endThresholdEditingForCapture()
         guard let value = currentDisplayAmbientProxy else {
             captureBrightButton.state = .off
             ambientStatusLabel.stringValue = "暂时无法读取 Studio Display 光线传感器"
             NSSound.beep()
             return
         }
-        ambientCloseThreshold = value
-        UserDefaults.standard.set(value, forKey: "ambientCloseThreshold")
-        ambientThresholdSource = "studioDisplayALS-v1"
-        UserDefaults.standard.set("studioDisplayALS-v1", forKey: "ambientThresholdSource")
-        updateAmbientStatusLabel()
-        flashCaptureSuccess(button: captureBrightButton, valueLabel: brightThresholdLabel)
+        applyAmbientThreshold(value, isClose: true)
+        flashCaptureSuccess(button: captureBrightButton, valueLabel: brightThresholdField)
         log("已采集环境关灯点：\(currentAmbientSourceName) 响应分数 \(value)")
     }
 
+    /// 手动填写或采集后统一写入标定值，保证持久化键与数据源一致。
+    private func applyAmbientThreshold(_ value: Int, isClose: Bool) {
+        if isClose {
+            ambientCloseThreshold = value
+            UserDefaults.standard.set(value, forKey: "ambientCloseThreshold")
+        } else {
+            ambientOpenThreshold = value
+            UserDefaults.standard.set(value, forKey: "ambientOpenThreshold")
+        }
+        ambientThresholdSource = "studioDisplayALS-v1"
+        UserDefaults.standard.set("studioDisplayALS-v1", forKey: "ambientThresholdSource")
+        updateAmbientStatusLabel()
+    }
+
+    /// 采集按钮与输入框共存：点采集时先取消编辑，并在短时间内忽略结束编辑的回写。
+    private func endThresholdEditingForCapture() {
+        thresholdCommitSuppressedUntil = Date().addingTimeInterval(0.5)
+        if brightThresholdField.currentEditor() != nil || darkThresholdField.currentEditor() != nil {
+            brightThresholdField.window?.makeFirstResponder(nil)
+        }
+    }
+
+    @objc private func ambientThresholdFieldEdited(_ sender: NSTextField) {
+        commitAmbientThreshold(from: sender)
+    }
+
+    private func commitAmbientThreshold(from field: NSTextField) {
+        guard Date() >= thresholdCommitSuppressedUntil else {
+            // 刚刚点过采集按钮：丢弃过期的编辑内容，避免覆盖采集结果。
+            syncThresholdFields(force: true)
+            return
+        }
+        let isClose = field === brightThresholdField
+        let text = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty, let value = Int(text), value >= 0, value <= 60000 else {
+            NSSound.beep()
+            syncThresholdFields(force: true)
+            if !text.isEmpty { ambientStatusLabel.stringValue = "标定值需为 0–60000 的整数" }
+            return
+        }
+        let unchanged = isClose ? ambientCloseThreshold == value : ambientOpenThreshold == value
+        applyAmbientThreshold(value, isClose: isClose)
+        if !unchanged {
+            log("已手动设置环境\(isClose ? "关灯点" : "开灯点")：\(value)")
+        }
+        flashCaptureSuccess(button: isClose ? captureBrightButton : captureDarkButton, valueLabel: field)
+    }
+
     @objc private func captureDarkThreshold() {
+        endThresholdEditingForCapture()
         guard let value = currentDisplayAmbientProxy else {
             captureDarkButton.state = .off
             ambientStatusLabel.stringValue = "暂时无法读取 Studio Display 光线传感器"
             NSSound.beep()
             return
         }
-        ambientOpenThreshold = value
-        UserDefaults.standard.set(value, forKey: "ambientOpenThreshold")
-        ambientThresholdSource = "studioDisplayALS-v1"
-        UserDefaults.standard.set("studioDisplayALS-v1", forKey: "ambientThresholdSource")
-        updateAmbientStatusLabel()
-        flashCaptureSuccess(button: captureDarkButton, valueLabel: darkThresholdLabel)
+        applyAmbientThreshold(value, isClose: false)
+        flashCaptureSuccess(button: captureDarkButton, valueLabel: darkThresholdField)
         log("已采集环境开灯点：\(currentAmbientSourceName) 响应分数 \(value)")
     }
 
@@ -988,15 +1135,22 @@ private final class StatusIndicator: NSObject {
     }
 
     private func updateAmbientStatusLabel() {
-        brightThresholdLabel.stringValue = ambientCloseThreshold.map(String.init) ?? "--"
-        darkThresholdLabel.stringValue = ambientOpenThreshold.map(String.init) ?? "--"
+        syncThresholdFields()
         captureBrightButton.state = .off
         captureDarkButton.state = .off
-        ambientEnableSwitch.state = areAmbientRulesEnabled ? .on : .off
-        ambientEnableSwitch.isEnabled = currentDisplayAmbientProxy != nil &&
+        let targetState: NSControl.StateValue = areAmbientRulesEnabled ? .on : .off
+        if ambientEnableSwitch.state != targetState {
+            log("环境光规则开关状态同步：\(ambientEnableSwitch.state == .on ? "开" : "关") → \(targetState == .on ? "开" : "关")")
+        }
+        ambientEnableSwitch.state = targetState
+        ambientEnableSwitch.isEnabled = isStudioDisplayAvailable && !isComboPolicyEnabled && currentDisplayAmbientProxy != nil &&
             (ambientCloseThreshold != nil || ambientOpenThreshold != nil)
         let currentText = currentDisplayAmbientProxy.map { "当前环境 \($0)" } ?? "当前环境 --"
-        if let close = ambientCloseThreshold, let open = ambientOpenThreshold, open >= close {
+        if isComboPolicyEnabled {
+            let close = ambientCloseThreshold.map(String.init) ?? "--"
+            let open = ambientOpenThreshold.map(String.init) ?? "--"
+            ambientStatusLabel.stringValue = "\(currentText) lux（环境估算，已扣除灯光） ·  ≤\(open) 补光 / ≥\(close) 关灯  ·  健康目标 300–500 lux"
+        } else if let close = ambientCloseThreshold, let open = ambientOpenThreshold, open >= close {
             ambientStatusLabel.stringValue = "\(currentText)  ·  阈值重叠，可能反复开关"
         } else if !areAmbientRulesEnabled, ambientCloseThreshold != nil || ambientOpenThreshold != nil {
             ambientStatusLabel.stringValue = "\(currentText)  ·  已保存，未启用"
@@ -1012,15 +1166,54 @@ private final class StatusIndicator: NSObject {
     @objc private func brightnessChanged() {
         let value = Int(brightnessSlider.doubleValue.rounded())
         brightnessValueLabel.stringValue = "\(value)%"
-        _ = lamp.setBrightness(value)
-        lamp.requestStatus()
+        guard isBrightnessSliderTracking else {
+            _ = lamp.setBrightness(value)
+            markManualOverride()
+            lamp.requestStatus()
+            return
+        }
+        // 拖动中：标签随时刷新，灯体写入限速 80ms，避免刷 HID 报文。
+        let now = Date()
+        if now.timeIntervalSince(lastSliderWriteAt) >= 0.08 {
+            lastSliderWriteAt = now
+            _ = lamp.setBrightness(value)
+            pendingBrightnessValue = nil
+        } else {
+            pendingBrightnessValue = value
+        }
     }
 
     @objc private func temperatureChanged() {
         let value = Int((temperatureSlider.doubleValue / 100).rounded()) * 100
         temperatureSlider.doubleValue = Double(value)
         temperatureValueLabel.stringValue = "\(value)K"
-        _ = lamp.setTemperature(value)
+        guard isTemperatureSliderTracking else {
+            _ = lamp.setTemperature(value)
+            markManualOverride()
+            lamp.requestStatus()
+            return
+        }
+        let now = Date()
+        if now.timeIntervalSince(lastSliderWriteAt) >= 0.08 {
+            lastSliderWriteAt = now
+            _ = lamp.setTemperature(value)
+            pendingTemperatureValue = nil
+        } else {
+            pendingTemperatureValue = value
+        }
+    }
+
+    /// 松手后补写最后一个值，并同步回读。
+    private func flushSliderInteraction() {
+        if let pending = pendingBrightnessValue {
+            _ = lamp.setBrightness(pending)
+            pendingBrightnessValue = nil
+        }
+        if let pending = pendingTemperatureValue {
+            _ = lamp.setTemperature(pending)
+            pendingTemperatureValue = nil
+        }
+        markManualOverride()
         lamp.requestStatus()
     }
 
@@ -1139,7 +1332,229 @@ private final class StatusIndicator: NSObject {
         lamp.requestStatus()
     }
 
+    @objc private func readingModeChanged() {
+        markManualOverride()
+        if readingModeSwitch.state == .on {
+            enterReadingMode()
+        } else {
+            leaveReadingMode()
+        }
+    }
+
+    private func enterReadingMode() {
+        guard lamp.isConnected else {
+            readingModeSwitch.state = .off
+            NSSound.beep()
+            log("阅读模式未应用：iScreenBar 未连接")
+            return
+        }
+        // 环境光规则会持续把灯压回关闭状态，与固定组合互斥，进入前先停用并解除关灯锁定。
+        if isAmbientLinkEnabled {
+            areAmbientRulesEnabled = false
+            UserDefaults.standard.set(false, forKey: "ambientRulesEnabled")
+            if ambientTurnedLampOff {
+                setAmbientLampLock(false)
+                _ = lamp.setPower(on: true)
+            }
+            restorePresenceAfterAmbientLock()
+            updateAmbientStatusLabel()
+            log("阅读模式已停用环境光规则并解除关灯锁定")
+        }
+        if !isReadingModeEnabled,
+           let brightness = lamp.currentBrightness,
+           let temperature = lamp.currentTemperature {
+            let snapshot = SavedMode(name: "阅读模式前", brightness: brightness, temperature: temperature,
+                                     videoMode: lamp.isVideoModeEnabled == true)
+            if let data = try? JSONEncoder().encode(snapshot) {
+                UserDefaults.standard.set(data, forKey: "readingModeRestore")
+            }
+            // 自动感光开启时回读的手动亮度不可用作恢复值，退出时改回自动感光。
+            UserDefaults.standard.set(lamp.isAutoLightEnabled == true, forKey: "readingModeRestoreAutoLight")
+        }
+        // 亮度跟随与色温随时间会持续覆写固定组合，进入前先关掉，并记住原开关以便退出时回滚。
+        UserDefaults.standard.set(isBrightnessFollowEnabled, forKey: "readingModeRestoreBrightnessFollow")
+        UserDefaults.standard.set(isTimeTemperatureEnabled, forKey: "readingModeRestoreTimeTemperature")
+        if isBrightnessFollowEnabled {
+            isBrightnessFollowEnabled = false
+            brightnessFollowSwitch.state = .off
+            UserDefaults.standard.set(false, forKey: "brightnessFollowEnabled")
+            log("阅读模式已关闭 Studio Display 亮度跟随")
+        }
+        if isTimeTemperatureEnabled {
+            isTimeTemperatureEnabled = false
+            timeTemperatureSwitch.state = .off
+            lastScheduledTemperature = nil
+            lastScheduledTemperatureChangeAt = .distantPast
+            UserDefaults.standard.set(false, forKey: "timeTemperatureEnabled")
+            log("阅读模式已关闭色温随时间")
+        }
+        guard lamp.setPower(on: true),
+              lamp.setBrightness(readingModeBrightness),
+              lamp.setTemperature(readingModeTemperature) else {
+            readingModeSwitch.state = .off
+            NSSound.beep()
+            log("阅读模式应用失败：USB HID 指令未成功")
+            return
+        }
+        _ = lamp.setVideoMode(enabled: false)
+        isReadingModeEnabled = true
+        UserDefaults.standard.set(true, forKey: "readingModeEnabled")
+        log("已开启阅读模式：亮度 \(readingModeBrightness)%、色温 \(readingModeTemperature)K、视频模式关闭")
+        refreshControls()
+        lamp.requestStatus()
+    }
+
+    private func leaveReadingMode() {
+        isReadingModeEnabled = false
+        UserDefaults.standard.set(false, forKey: "readingModeEnabled")
+        guard let data = UserDefaults.standard.data(forKey: "readingModeRestore"),
+              let snapshot = try? JSONDecoder().decode(SavedMode.self, from: data) else {
+            log("已退出阅读模式，未找到可恢复的灯态")
+            refreshControls()
+            return
+        }
+        _ = lamp.setTemperature(snapshot.temperature)
+        _ = lamp.setVideoMode(enabled: snapshot.videoMode)
+        if UserDefaults.standard.bool(forKey: "readingModeRestoreAutoLight"), lamp.setAutoLight(enabled: true) {
+            log("已退出阅读模式，恢复自动感光与色温 \(snapshot.temperature)K")
+        } else if snapshot.brightness >= 5 {
+            _ = lamp.setBrightness(snapshot.brightness)
+            log("已退出阅读模式，恢复亮度 \(snapshot.brightness)%、色温 \(snapshot.temperature)K")
+        } else {
+            // 自动感光开启时回读的手动亮度是固件残留值（通常为 1%），不能当恢复值用。
+            log("已退出阅读模式，快照亮度 \(snapshot.brightness)% 无效（自动感光残留），保留当前亮度")
+        }
+        if UserDefaults.standard.bool(forKey: "readingModeRestoreTimeTemperature"), !isTimeTemperatureEnabled {
+            isTimeTemperatureEnabled = true
+            UserDefaults.standard.set(true, forKey: "timeTemperatureEnabled")
+            timeTemperatureSwitch.state = .on
+            log("已退出阅读模式，恢复色温随时间")
+        }
+        if UserDefaults.standard.bool(forKey: "readingModeRestoreBrightnessFollow"), !isBrightnessFollowEnabled {
+            isBrightnessFollowEnabled = true
+            UserDefaults.standard.set(true, forKey: "brightnessFollowEnabled")
+            brightnessFollowSwitch.state = .on
+            log("已退出阅读模式，恢复亮度跟随")
+        }
+        refreshControls()
+        lamp.requestStatus()
+    }
+
+    @objc private func comboPolicyChanged() {
+        let requested = comboPolicySwitch.state == .on
+        isComboPolicyEnabled = requested
+        UserDefaults.standard.set(requested, forKey: "comboPolicyEnabled")
+        if requested {
+            // 旧环境光规则的开关灯职责由引擎接管，避免两套逻辑同时写电源；标定值继续作为亮度映射区间。
+            if areAmbientRulesEnabled {
+                areAmbientRulesEnabled = false
+                UserDefaults.standard.set(false, forKey: "ambientRulesEnabled")
+            }
+            if ambientTurnedLampOff {
+                setAmbientLampLock(false)
+                restorePresenceAfterAmbientLock()
+            }
+            updateAmbientStatusLabel()
+            // 策略引擎需要独占亮度与色温：关掉固件自动感光、亮度跟随与色温随时间。
+            if lamp.isAutoLightEnabled == true { _ = lamp.setAutoLight(enabled: false) }
+            autoLightSwitch.state = .off
+            if isBrightnessFollowEnabled {
+                isBrightnessFollowEnabled = false
+                brightnessFollowSwitch.state = .off
+                UserDefaults.standard.set(false, forKey: "brightnessFollowEnabled")
+            }
+            if isTimeTemperatureEnabled {
+                isTimeTemperatureEnabled = false
+                timeTemperatureSwitch.state = .off
+                UserDefaults.standard.set(false, forKey: "timeTemperatureEnabled")
+            }
+            // 开启组合后只需短暂让位（避免与刚写入的固件状态抢写），不需要像手动调灯那样停 15 分钟。
+            comboManualOverrideUntil = Date().addingTimeInterval(3)
+            log("已开启智能组合策略：入座与 Mac 活动决定开关，环境光决定亮度，时段为主决定色温")
+        } else {
+            // 引擎因环境过亮关灯时会暂停固件入座检测与自动感光，关闭组合时必须释放，否则会一直卡在暂停。
+            if ambientTurnedLampOff {
+                setAmbientLampLock(false)
+                restorePresenceAfterAmbientLock()
+            }
+            updateAmbientStatusLabel()
+            log("已关闭智能组合策略，恢复各功能独立工作")
+        }
+        refreshControls()
+        lamp.requestStatus()
+    }
+
+    @objc private func quitApplication() {
+        pendingDisplayPolicyWorkItem?.cancel()
+        pendingBuiltinWakeWorkItems.forEach { $0.cancel() }
+        pendingBuiltinWakeWorkItems.removeAll()
+        _ = displayController.setStudioEnabled(true)
+        _ = keepAwakeController.setActive(false)
+        log("用户从面板退出应用，版本 \(appVersionText())")
+        NSApp.terminate(nil)
+    }
+
+    /// 灵敏度枚举对应的中文，便于读日志时不再误以为 2 是“两档”之类的含义。
+    private func presenceSensitivityLabel(_ value: Int) -> String {
+        switch value {
+        case 0: return "低(0)"
+        case 1: return "中(1)"
+        default: return "高(2)"
+        }
+    }
+
+    /// 启动后把面板里的离席时间/灵敏度同步给灯体，避免两边参数不一致导致“以为改了但没生效”。
+    func syncPresenceSettingsIfNeeded() {
+        guard !didSyncPresenceSettings, let presenceEnabled = lamp.isPresenceDetectionEnabled else { return }
+        didSyncPresenceSettings = true
+        guard presenceEnabled else { return }
+        if lamp.setPresenceDetection(enabled: true, delaySeconds: presenceDelaySeconds, sensitivity: presenceSensitivity) {
+            log("已同步入座检测参数到灯体：离席 \(presenceDelaySeconds) 秒、灵敏度 \(presenceSensitivityLabel(presenceSensitivity))")
+        }
+    }
+
+    /// 组合模式用：根据当前是否“需要灯体自己点灯”来启用/停用入座检测，
+    /// 避免固件的自动开灯与“环境充足关灯”互相拆台。
+    @discardableResult
+    func updateFirmwarePresence(requested: Bool) -> Bool {
+        guard didSyncPresenceSettings, lamp.isConnected else { return false }
+        guard lamp.isPresenceDetectionEnabled != requested else { return false }
+        let success = setFirmwarePresenceEnabled(requested)
+        if success {
+            isPresenceSuspendedByPolicy = !requested
+            log(requested
+                ? "已启用灯体入座检测（需要它感知入座/自动点灯）"
+                : "已停用灯体入座检测（环境充足，改用键鼠活动判定）")
+        }
+        return success
+    }
+
+    /// 组合模式用：临时启用/停用灯体入座检测（无人时避免固件误触发点灯）。
+    @discardableResult
+    func setFirmwarePresenceEnabled(_ enabled: Bool) -> Bool {
+        let success = lamp.setPresenceDetection(enabled: enabled,
+                                               delaySeconds: presenceDelaySeconds,
+                                               sensitivity: presenceSensitivity)
+        if success { refreshControls() }
+        return success
+    }
+
+    /// 策略引擎使用的时段色温基线（与「色温随时间」同一曲线）。
+    func baselineTemperature(at date: Date) -> Int {
+        return scheduledTemperature(at: date)
+    }
+
+    func setComboStatus(_ text: String) {
+        guard comboStatusLabel.stringValue != text else { return }
+        comboStatusLabel.stringValue = text
+    }
+
+    func markManualOverride(seconds: TimeInterval = 900) {
+        comboManualOverrideUntil = Date().addingTimeInterval(seconds)
+    }
+
     @objc private func presetChanged(_ sender: NSMenuItem) {
+        markManualOverride()
         let index = sender.tag
         let preset: (brightness: Int, temperature: Int, video: Bool)
         if (index == 0 || index >= 3),
@@ -1353,10 +1768,14 @@ private final class StatusIndicator: NSObject {
     }
 
     func applyModeForFrontmostAppIfNeeded() {
+        // 未连接 Studio Display 时处于待机，不做任何灯体写入。
+        guard isStudioDisplayAvailable, lamp.isConnected else { return }
         guard let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
               bundleID != lastFrontmostBundleID else { return }
         lastFrontmostBundleID = bundleID
         guard let mode = loadAppModes()[bundleID] else { return }
+        // 组合模式下应用绑定属于用户显式动作，写入后给引擎一个保护期。
+        if isComboPolicyEnabled { markManualOverride() }
         _ = lamp.setPower(on: true)
         _ = lamp.setBrightness(mode.brightness)
         _ = lamp.setTemperature(mode.temperature)
@@ -1524,6 +1943,10 @@ private final class StatusIndicator: NSObject {
             // 只在确认会话已锁定时请求系统立即熄屏，不影响解锁后的显示配置。
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                 guard isConsoleSessionLocked() else { return }
+                // 刚发生过入座唤醒时不要立刻又熄屏，否则会形成循环。
+                guard Date().timeIntervalSince(lastPresenceWakeAt) > 120,
+                      Date().timeIntervalSince(lastForcedDisplaySleepAt) > 300 else { return }
+                lastForcedDisplaySleepAt = Date()
                 log(requestSystemDisplaySleep()
                     ? "检测到 Mac 已锁定，已请求系统立即熄屏"
                     : "检测到 Mac 已锁定，但系统熄屏请求失败")
@@ -1783,10 +2206,20 @@ private final class StatusIndicator: NSObject {
         powerSwitch.action = #selector(powerChanged)
         brightnessSlider.target = self
         brightnessSlider.action = #selector(brightnessChanged)
-        brightnessSlider.isContinuous = false
+        brightnessSlider.isContinuous = true
+        brightnessSlider.onTrackingChanged = { [weak self] tracking in
+            guard let self else { return }
+            self.isBrightnessSliderTracking = tracking
+            if !tracking { self.flushSliderInteraction() }
+        }
         temperatureSlider.target = self
         temperatureSlider.action = #selector(temperatureChanged)
-        temperatureSlider.isContinuous = false
+        temperatureSlider.isContinuous = true
+        temperatureSlider.onTrackingChanged = { [weak self] tracking in
+            guard let self else { return }
+            self.isTemperatureSliderTracking = tracking
+            if !tracking { self.flushSliderInteraction() }
+        }
         temperatureSlider.numberOfTickMarks = 5
         temperatureSlider.tickMarkPosition = .below
         timeTemperatureSwitch.target = self
@@ -1816,6 +2249,16 @@ private final class StatusIndicator: NSObject {
         presenceSensitivityPopup.action = #selector(presenceSensitivityChanged)
         videoModeSwitch.target = self
         videoModeSwitch.action = #selector(videoModeChanged)
+        readingModeSwitch.target = self
+        readingModeSwitch.action = #selector(readingModeChanged)
+        readingModeSwitch.toolTip = "一键应用护眼组合：亮度 70%、色温 4200K、关闭视频模式；关闭时恢复进入前的灯态"
+        comboPolicySwitch.target = self
+        comboPolicySwitch.action = #selector(comboPolicyChanged)
+        comboPolicySwitch.toolTip = "组合策略：入座/离座与 Mac 活动决定开关，环境光决定亮度，时段为主决定色温；开启后自动关闭自动感光、亮度跟随与色温随时间"
+        comboStatusLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
+        comboStatusLabel.textColor = .secondaryLabelColor
+        comboStatusLabel.isHidden = !isComboPolicyEnabled
+        comboStatusLabel.widthAnchor.constraint(equalToConstant: UIStyle.contentWidth).isActive = true
         modeButton.image = NSImage(systemSymbolName: "chevron.up.chevron.down", accessibilityDescription: nil)
         modeButton.imagePosition = .imageTrailing
         modeButton.alignment = .left
@@ -1850,10 +2293,8 @@ private final class StatusIndicator: NSObject {
         captureDarkButton.toolTip = "点击后将当前环境值保存为昏暗开灯点"
         ambientEnableSwitch.target = self
         ambientEnableSwitch.action = #selector(ambientEnableChanged)
-        for label in [brightThresholdLabel, darkThresholdLabel] {
-            label.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
-            label.textColor = .secondaryLabelColor
-            label.alignment = .right
+        for field in [brightThresholdField, darkThresholdField] {
+            field.delegate = self
         }
         ambientStatusLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
         ambientStatusLabel.textColor = .secondaryLabelColor
@@ -1909,12 +2350,13 @@ private final class StatusIndicator: NSObject {
         let featureGrid = NSGridView(views: [
             [powerSwitch, autoLightSwitch, presenceSwitch],
             [videoModeSwitch, brightnessFollowSwitch, powerSyncSwitch],
-            [timeTemperatureSwitch, displayBrightnessLockSwitch, keepAwakeSwitch]
+            [timeTemperatureSwitch, displayBrightnessLockSwitch, keepAwakeSwitch],
+            [readingModeSwitch, comboPolicySwitch, NSView()]
         ])
         featureGrid.rowSpacing = 6
         featureGrid.columnSpacing = 6
         featureGrid.xPlacement = .fill
-        for button in [powerSwitch, autoLightSwitch, presenceSwitch, videoModeSwitch, brightnessFollowSwitch, powerSyncSwitch, timeTemperatureSwitch, displayBrightnessLockSwitch, keepAwakeSwitch] {
+        for button in [powerSwitch, autoLightSwitch, presenceSwitch, videoModeSwitch, brightnessFollowSwitch, powerSyncSwitch, timeTemperatureSwitch, displayBrightnessLockSwitch, keepAwakeSwitch, readingModeSwitch, comboPolicySwitch] {
             button.widthAnchor.constraint(equalToConstant: 100).isActive = true
             button.heightAnchor.constraint(equalToConstant: 40).isActive = true
         }
@@ -1956,17 +2398,17 @@ private final class StatusIndicator: NSObject {
         ambientHeader.spacing = 6
         ambientHeader.widthAnchor.constraint(equalToConstant: UIStyle.contentWidth).isActive = true
         for button in [captureBrightButton, captureDarkButton] {
-            button.widthAnchor.constraint(equalToConstant: 106).isActive = true
+            button.widthAnchor.constraint(equalToConstant: 92).isActive = true
             button.heightAnchor.constraint(equalToConstant: 40).isActive = true
         }
-        for label in [brightThresholdLabel, darkThresholdLabel] {
-            label.widthAnchor.constraint(equalToConstant: 34).isActive = true
+        for label in [brightThresholdField, darkThresholdField] {
+            label.widthAnchor.constraint(equalToConstant: 52).isActive = true
         }
-        let brightCapture = NSStackView(views: [captureBrightButton, brightThresholdLabel])
+        let brightCapture = NSStackView(views: [captureBrightButton, brightThresholdField])
         brightCapture.orientation = .horizontal
         brightCapture.alignment = .centerY
         brightCapture.spacing = 4
-        let darkCapture = NSStackView(views: [captureDarkButton, darkThresholdLabel])
+        let darkCapture = NSStackView(views: [captureDarkButton, darkThresholdField])
         darkCapture.orientation = .horizontal
         darkCapture.alignment = .centerY
         darkCapture.spacing = 4
@@ -2005,9 +2447,29 @@ private final class StatusIndicator: NSObject {
         rotationPresetHeader.widthAnchor.constraint(equalToConstant: UIStyle.contentWidth).isActive = true
         presetContainer.setViews([presetTitle, modeButton, rotationPresetHeader, rotationModeButton], in: .top)
 
-        let stack = NSStackView(views: [header, separator(), featureContainer, separator(), adjustmentContainer,
+        standbyLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        standbyLabel.textColor = .secondaryLabelColor
+        standbyLabel.isHidden = isStudioDisplayAvailable
+        standbyLabel.widthAnchor.constraint(equalToConstant: UIStyle.contentWidth).isActive = true
+        versionLabel.stringValue = appVersionText()
+        versionLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
+        versionLabel.textColor = .tertiaryLabelColor
+        let quitButton = NSButton(title: "退出应用", target: self, action: #selector(quitApplication))
+        quitButton.bezelStyle = .inline
+        quitButton.controlSize = .small
+        quitButton.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
+        quitButton.imagePosition = .imageLeading
+        quitButton.font = UIStyle.controlFont
+        quitButton.toolTip = "退出 iScreen Menu；下次登录或重新运行 install.sh 才会启动"
+        let footer = NSStackView(views: [versionLabel, flexibleSpace(), quitButton])
+        footer.orientation = .horizontal
+        footer.alignment = .centerY
+        footer.spacing = 6
+        footer.widthAnchor.constraint(equalToConstant: UIStyle.contentWidth).isActive = true
+
+        let stack = NSStackView(views: [header, standbyLabel, separator(), featureContainer, comboStatusLabel, separator(), adjustmentContainer,
                                        separator(), ambientContainer, separator(), presenceContainer, separator(), displayContainer,
-                                       separator(), presetContainer])
+                                       separator(), presetContainer, separator(), footer])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
@@ -2018,7 +2480,7 @@ private final class StatusIndicator: NSObject {
         }
 
         let controller = NSViewController()
-        controller.view = NSView(frame: NSRect(x: 0, y: 0, width: UIStyle.panelWidth, height: 626))
+        controller.view = NSView(frame: NSRect(x: 0, y: 0, width: UIStyle.panelWidth, height: 710))
         controller.view.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: controller.view.leadingAnchor),
@@ -2027,7 +2489,7 @@ private final class StatusIndicator: NSObject {
             stack.bottomAnchor.constraint(lessThanOrEqualTo: controller.view.bottomAnchor)
         ])
         popover.contentViewController = controller
-        popover.contentSize = NSSize(width: UIStyle.panelWidth, height: 626)
+        popover.contentSize = NSSize(width: UIStyle.panelWidth, height: 710)
         popover.behavior = .transient
     }
 
@@ -2102,7 +2564,10 @@ private final class StatusIndicator: NSObject {
     }
 
     private func refreshControls() {
-        let displayControlsAllowed = isDisplaySessionSafe && !isConsoleSessionLocked()
+        // 未连接 Studio Display 时整个面板进入待机：仅保留防休眠可用。
+        let standby = !isStudioDisplayAvailable
+        standbyLabel.isHidden = !standby
+        let displayControlsAllowed = isStudioDisplayAvailable && isDisplaySessionSafe && !isConsoleSessionLocked()
         let studioID = displayController.studioTarget()
         studioPowerSwitch.state = studioID != nil && !displayController.isStudioCovered ? .on : .off
         studioPowerSwitch.isEnabled = displayControlsAllowed && studioID != nil
@@ -2139,17 +2604,27 @@ private final class StatusIndicator: NSObject {
                 ? "原设置已开启；关灯锁定期间临时暂停，解除后自动恢复"
                 : "关灯锁定期间不可开启入座检测"
         } else {
-            presenceSwitch.title = "入座检测"
-            presenceSwitch.state = lamp.isPresenceDetectionEnabled == true ? .on : .off
-            presenceSwitch.toolTip = "开启或关闭灯体入座检测"
+            if isPresenceSuspendedByPolicy, lamp.isPresenceDetectionEnabled != true {
+                presenceSwitch.title = "入座检测·暂停"
+                presenceSwitch.state = .off
+                presenceSwitch.toolTip = "环境光已充足，策略临时停用灯体入座检测避免自动点灯；屏幕休眠时会自动恢复"
+            } else {
+                presenceSwitch.title = "入座检测"
+                presenceSwitch.state = lamp.isPresenceDetectionEnabled == true ? .on : .off
+                presenceSwitch.toolTip = "开启或关闭灯体入座检测"
+            }
         }
         videoModeSwitch.state = lamp.isVideoModeEnabled == true ? .on : .off
         brightnessFollowSwitch.state = isBrightnessFollowEnabled ? .on : .off
+        brightnessFollowSwitch.isEnabled = !standby && lamp.isConnected && !isComboPolicyEnabled
         displayBrightnessLockSwitch.state = isDisplayBrightnessLockEnabled ? .on : .off
         displayBrightnessLockSwitch.isEnabled = displayControlsAllowed && studioDisplayID() != nil && activeBuiltinDisplayID() != nil
         powerSyncSwitch.state = isPowerSyncEnabled ? .on : .off
         keepAwakeSwitch.state = keepAwakeController.isActive ? .on : .off
         timeTemperatureSwitch.state = isTimeTemperatureEnabled ? .on : .off
+        readingModeSwitch.state = isReadingModeEnabled ? .on : .off
+        comboPolicySwitch.state = isComboPolicyEnabled ? .on : .off
+        comboStatusLabel.isHidden = !isComboPolicyEnabled
         updateAmbientStatusLabel()
         if let builtin = displayController.builtinDisplay() {
             let online = CGDisplayIsOnline(builtin) != 0
@@ -2170,32 +2645,273 @@ private final class StatusIndicator: NSObject {
         rotationModeButton.title = loadRotationPreset().name
         selectPresenceDelay(presenceDelaySeconds)
         presenceSensitivityPopup.selectItem(withTag: presenceSensitivity)
-        if let brightness = lamp.currentBrightness {
+        if let brightness = lamp.currentBrightness, !isBrightnessSliderTracking {
             brightnessSlider.doubleValue = Double(brightness)
             brightnessValueLabel.stringValue = "\(brightness)%"
         }
-        if let temperature = lamp.currentTemperature {
+        if let temperature = lamp.currentTemperature, !isTemperatureSliderTracking {
             temperatureSlider.doubleValue = Double(temperature)
             temperatureValueLabel.stringValue = "\(temperature)K"
         }
-        let enabled = lamp.isConnected
+        let enabled = !standby && lamp.isConnected
+        modeButton.isEnabled = enabled
+        bindAppButton.isEnabled = enabled
+        brightThresholdField.isEnabled = !standby
+        darkThresholdField.isEnabled = !standby
         powerSwitch.isEnabled = enabled
-        autoLightSwitch.isEnabled = enabled && !isAmbientPresenceLockActive
+        autoLightSwitch.isEnabled = enabled && !isAmbientPresenceLockActive && !isComboPolicyEnabled
         brightnessSlider.isEnabled = enabled
         temperatureSlider.isEnabled = enabled && !isTimeTemperatureEnabled
-        timeTemperatureSwitch.isEnabled = enabled
+        timeTemperatureSwitch.isEnabled = enabled && !isComboPolicyEnabled
         presenceSwitch.isEnabled = enabled && !isAmbientPresenceLockActive && !isScreenSleepPresenceLockActive
         videoModeSwitch.isEnabled = enabled
+        readingModeSwitch.isEnabled = enabled
+        comboPolicySwitch.isEnabled = enabled
         powerSyncSwitch.isEnabled = enabled
-        captureBrightButton.isEnabled = currentDisplayAmbientProxy != nil
-        captureDarkButton.isEnabled = currentDisplayAmbientProxy != nil
+        captureBrightButton.isEnabled = !standby && currentDisplayAmbientProxy != nil
+        captureDarkButton.isEnabled = !standby && currentDisplayAmbientProxy != nil
         presenceDelayPopup.isEnabled = enabled
         presenceSensitivityPopup.isEnabled = enabled
+        publishPanelSnapshot()
+    }
+
+    // MARK: - SwiftUI 面板桥接
+
+    /// 用 SwiftUI + Liquid Glass 面板替换 AppKit 布局，原有控件对象保留作为状态载体。
+    private func installGlassPanel() {
+        panelModel.actions = PanelActions(
+            setPower: { [weak self] on in
+                guard let self else { return }
+                self.powerSwitch.state = on ? .on : .off
+                self.powerChanged()
+            },
+            setBrightness: { [weak self] value in
+                guard let self else { return }
+                self.brightnessSlider.doubleValue = value.rounded()
+                self.brightnessValueLabel.stringValue = "\(Int(value.rounded()))%"
+                self.brightnessChanged()
+            },
+            brightnessEditing: { [weak self] editing in
+                guard let self else { return }
+                self.isBrightnessSliderTracking = editing
+                if !editing { self.flushSliderInteraction() }
+            },
+            setTemperature: { [weak self] value in
+                guard let self else { return }
+                self.temperatureSlider.doubleValue = value
+                self.temperatureChanged()
+            },
+            temperatureEditing: { [weak self] editing in
+                guard let self else { return }
+                self.isTemperatureSliderTracking = editing
+                if !editing { self.flushSliderInteraction() }
+            },
+            setAutoLight: { [weak self] on in
+                guard let self else { return }
+                self.autoLightSwitch.state = on ? .on : .off
+                self.autoLightChanged()
+            },
+            setPresence: { [weak self] on in
+                guard let self else { return }
+                self.presenceSwitch.state = on ? .on : .off
+                self.presenceChanged()
+            },
+            setPresenceDelay: { [weak self] seconds in
+                guard let self else { return }
+                self.selectPresenceDelay(seconds)
+                self.presenceDelayChanged()
+            },
+            setPresenceSensitivity: { [weak self] value in
+                guard let self else { return }
+                self.presenceSensitivityPopup.selectItem(withTag: value)
+                self.presenceSensitivityChanged()
+            },
+            setVideoMode: { [weak self] on in
+                guard let self else { return }
+                self.videoModeSwitch.state = on ? .on : .off
+                self.videoModeChanged()
+            },
+            setBrightnessFollow: { [weak self] on in
+                guard let self else { return }
+                self.brightnessFollowSwitch.state = on ? .on : .off
+                self.brightnessFollowChanged()
+            },
+            setPowerSync: { [weak self] on in
+                guard let self else { return }
+                self.powerSyncSwitch.state = on ? .on : .off
+                self.powerSyncChanged()
+            },
+            setTimeTemperature: { [weak self] on in
+                guard let self else { return }
+                self.timeTemperatureSwitch.state = on ? .on : .off
+                self.timeTemperatureChanged()
+            },
+            setDisplayLock: { [weak self] on in
+                guard let self else { return }
+                self.displayBrightnessLockSwitch.state = on ? .on : .off
+                self.displayBrightnessLockChanged()
+            },
+            setKeepAwake: { [weak self] on in
+                guard let self else { return }
+                self.keepAwakeSwitch.state = on ? .on : .off
+                self.keepAwakeChanged()
+            },
+            setReadingMode: { [weak self] on in
+                guard let self else { return }
+                self.readingModeSwitch.state = on ? .on : .off
+                self.readingModeChanged()
+            },
+            setCombo: { [weak self] on in
+                guard let self else { return }
+                self.comboPolicySwitch.state = on ? .on : .off
+                self.comboPolicyChanged()
+            },
+            captureClose: { [weak self] in self?.captureBrightThreshold() },
+            captureOpen: { [weak self] in self?.captureDarkThreshold() },
+            commitClose: { [weak self] text in self?.commitAmbientText(text, isClose: true) },
+            commitOpen: { [weak self] text in self?.commitAmbientText(text, isClose: false) },
+            setAmbientRules: { [weak self] on in
+                guard let self else { return }
+                self.ambientEnableSwitch.state = on ? .on : .off
+                self.ambientEnableChanged()
+            },
+            setBuiltin: { [weak self] on in
+                guard let self else { return }
+                self.displayPowerSwitch.state = on ? .on : .off
+                self.displayPowerChanged()
+            },
+            rotateBuiltin: { [weak self] in self?.displayRotationChanged() },
+            setStudio: { [weak self] on in
+                guard let self else { return }
+                self.studioPowerSwitch.state = on ? .on : .off
+                self.studioPowerChanged()
+            },
+            setDisplayAutoPreset: { [weak self] on in
+                guard let self else { return }
+                self.displayAutoPresetSwitch.state = on ? .on : .off
+                self.displayAutoPresetChanged()
+            },
+            applyMode: { [weak self] index in
+                guard let self else { return }
+                let item = NSMenuItem(title: self.modeNames()[index], action: nil, keyEquivalent: "")
+                item.tag = index
+                self.presetChanged(item)
+            },
+            showModeCenter: { [weak self] in self?.showModeCenter() },
+            bindCurrentApp: { [weak self] in self?.bindCurrentModeToApp() },
+            applyRotationPreset: { [weak self] in self?.applyRotationPreset() },
+            saveRotationPreset: { [weak self] in self?.saveCurrentRotationPreset() },
+            toggleRotationAutomation: { [weak self] in self?.toggleRotationPresetAutomation() },
+            quit: { [weak self] in self?.quitApplication() }
+        )
+        let host = NSHostingController(rootView: GlassPanelView(model: panelModel))
+        host.view.frame = NSRect(x: 0, y: 0, width: 372, height: 720)
+        host.view.wantsLayer = true
+        host.view.layer?.backgroundColor = NSColor.clear.cgColor
+        glassHostController = host
+        popover.contentViewController = host
+        popover.contentSize = NSSize(width: 372, height: 720)
+    }
+
+    /// 把 AppKit 控件上的当前状态镜像给 SwiftUI 面板。
+    private func publishPanelSnapshot() {
+        var snapshot = PanelSnapshot()
+        snapshot.standbyNote = isStudioDisplayAvailable ? nil : "未检测到 Studio Display，功能待机"
+        snapshot.lampConnected = lamp.isConnected
+        snapshot.powerOn = powerSwitch.state == .on
+        snapshot.brightness = Double(lamp.currentBrightness ?? Int(brightnessSlider.doubleValue))
+        snapshot.brightnessText = brightnessValueLabel.stringValue
+        snapshot.temperature = Double(lamp.currentTemperature ?? Int(temperatureSlider.doubleValue))
+        snapshot.temperatureText = temperatureValueLabel.stringValue
+        snapshot.autoLightOn = autoLightSwitch.state == .on
+        snapshot.autoLightTitle = autoLightSwitch.title
+        snapshot.autoLightEnabled = autoLightSwitch.isEnabled
+        snapshot.presenceOn = presenceSwitch.state == .on
+        snapshot.presenceTitle = presenceSwitch.title
+        snapshot.presenceEnabled = presenceSwitch.isEnabled
+        snapshot.videoOn = videoModeSwitch.state == .on
+        snapshot.brightnessFollowOn = brightnessFollowSwitch.state == .on
+        snapshot.brightnessFollowEnabled = brightnessFollowSwitch.isEnabled
+        snapshot.powerSyncOn = powerSyncSwitch.state == .on
+        snapshot.timeTemperatureOn = timeTemperatureSwitch.state == .on
+        snapshot.timeTemperatureEnabled = timeTemperatureSwitch.isEnabled
+        snapshot.displayLockOn = displayBrightnessLockSwitch.state == .on
+        snapshot.displayLockEnabled = displayBrightnessLockSwitch.isEnabled
+        snapshot.keepAwakeOn = keepAwakeSwitch.state == .on
+        snapshot.readingModeOn = readingModeSwitch.state == .on
+        snapshot.comboOn = comboPolicySwitch.state == .on
+        snapshot.comboStatus = comboStatusLabel.stringValue
+        snapshot.presenceDelay = presenceDelaySeconds
+        snapshot.presenceDelayOptions = presenceDelayOptions.map { seconds in
+            PresenceDelayOption(id: seconds, label: "\(seconds / 60) 分钟")
+        }
+        snapshot.presenceSensitivity = presenceSensitivity
+        snapshot.ambientCloseText = brightThresholdField.stringValue
+        snapshot.ambientOpenText = darkThresholdField.stringValue
+        snapshot.ambientStatus = ambientStatusLabel.stringValue
+        snapshot.ambientRulesOn = ambientEnableSwitch.state == .on
+        snapshot.ambientRulesEnabled = ambientEnableSwitch.isEnabled
+        snapshot.ambientFieldsEnabled = brightThresholdField.isEnabled
+        snapshot.captureEnabled = captureBrightButton.isEnabled
+        snapshot.builtinOn = displayPowerSwitch.state == .on
+        snapshot.builtinEnabled = displayPowerSwitch.isEnabled
+        snapshot.rotateTitle = displayRotateButton.title
+        snapshot.rotateEnabled = displayRotateButton.isEnabled
+        snapshot.studioOn = studioPowerSwitch.state == .on
+        snapshot.studioEnabled = studioPowerSwitch.isEnabled
+        snapshot.displayAutoPresetOn = displayAutoPresetSwitch.state == .on
+        snapshot.displayAutoPresetEnabled = displayAutoPresetSwitch.isEnabled
+        snapshot.modeTitle = modeButton.title
+        snapshot.modeItems = modeNames()
+        snapshot.rotationTitle = rotationModeButton.title
+        snapshot.bindTitle = bindAppButton.title
+        snapshot.version = appVersionText()
+        if panelModel.snapshot != snapshot {
+            panelModel.snapshot = snapshot
+        }
+    }
+
+    /// SwiftUI 输入框提交：校验后写入标定值。
+    private func commitAmbientText(_ text: String, isClose: Bool) {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard let value = Int(trimmed), value >= 0, value <= 60000 else {
+            NSSound.beep()
+            ambientStatusLabel.stringValue = "标定值需为 0–60000 的整数"
+            publishPanelSnapshot()
+            return
+        }
+        applyAmbientThreshold(value, isClose: isClose)
+        log("已手动设置环境\(isClose ? "关灯点" : "开灯点")：\(value)")
+        publishPanelSnapshot()
+    }
+
+    private func syncThresholdFields(force: Bool = false) {
+        if force || brightThresholdField.currentEditor() == nil {
+            brightThresholdField.stringValue = ambientCloseThreshold.map(String.init) ?? "--"
+        }
+        if force || darkThresholdField.currentEditor() == nil {
+            darkThresholdField.stringValue = ambientOpenThreshold.map(String.init) ?? "--"
+        }
+    }
+
+    private static func thresholdField() -> NSTextField {
+        let field = NSTextField(string: "--")
+        field.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        field.alignment = .right
+        field.controlSize = .small
+        field.bezelStyle = .roundedBezel
+        field.isEditable = true
+        field.isSelectable = true
+        field.toolTip = "可直接输入数值，回车或失焦即保存；也可用左侧按钮采集当前环境值"
+        return field
     }
 
     private func updateIcon(healthy: Bool) {
         let iconColor: NSColor
-        if !healthy {
+        if !isStudioDisplayAvailable {
+            // 待机：未连接 Studio Display 不算异常，用灰色区分。
+            iconColor = .systemGray
+        } else if !healthy {
             iconColor = .systemRed
         } else if lamp.isPowerOn == true {
             iconColor = .systemYellow
@@ -2224,6 +2940,13 @@ private final class StatusIndicator: NSObject {
         return presenceDelayPopup.selectedItem?.tag ?? presenceDelaySeconds
     }
 
+}
+
+extension StatusIndicator: NSTextFieldDelegate {
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField else { return }
+        commitAmbientThreshold(from: field)
+    }
 }
 
 private final class LampController {
@@ -2629,6 +3352,18 @@ if let displayID {
 var wasAsleep = displayID.map { CGDisplayIsAsleep($0) != 0 } ?? false
 var wasConsoleSessionLocked = isConsoleSessionLocked()
 var helperTurnedLampOff = false
+/// 入座唤醒显示器的限速时间戳，避免固件反复点亮时不断发唤醒。
+var lastPresenceWakeAt = Date.distantPast
+/// 上一次观察到的灯体电源状态，用于识别“固件自行点亮”这种入座事件。
+var lastKnownLampPower: Bool?
+/// 最近一次“固件报告有人入座”的时间，短时间内视为有人在座。
+var lastPresenceEventAt = Date.distantPast
+/// 入座检测启停去抖：期望状态、变更时间与上次下发时间。
+var lastPresenceDesire: Bool?
+var presenceDesireSince = Date()
+var lastPresenceToggleAt = Date.distantPast
+/// 上次强制系统熄屏的时间，用于限速，避免与人座唤醒形成循环。
+var lastForcedDisplaySleepAt = Date.distantPast
 var ambientTurnedLampOff = UserDefaults.standard.bool(forKey: "ambientLampLockActive")
 var ambientCloseCandidateSince: Date?
 var ambientOpenCandidateSince: Date?
@@ -2645,6 +3380,8 @@ private func setAmbientLampLock(_ active: Bool) {
     }
 }
 private let statusIndicator = StatusIndicator(isAsleep: wasAsleep, lamp: lamp)
+log("启动：\(Bundle.main.bundleURL.path)，\(appVersionText())")
+log("策略状态：智能组合=\(statusIndicator.isComboPolicyEnabled ? "开" : "关")，环境规则=\(statusIndicator.isAmbientLinkEnabled ? "开" : "关")，标定=关灯\(statusIndicator.ambientCloseThreshold.map(String.init) ?? "无")/开灯\(statusIndicator.ambientOpenThreshold.map(String.init) ?? "无")")
 statusIndicator.handleStudioDisplayConnection(connected: displayID != nil)
 if !wasAsleep {
     statusIndicator.restorePresenceAfterScreenWake()
@@ -2675,14 +3412,207 @@ if wasBrightnessFollowEnabled {
     log("Studio Display 亮度跟随已开启，正在锁定当前亮度差")
 }
 
+private struct ComboPolicyState {
+    var lastBrightness: Int?
+    var lastTemperature: Int?
+    var lastBrightnessWriteAt = Date.distantPast
+    var lastTemperatureWriteAt = Date.distantPast
+    var lastEnginePowerOffAt = Date.distantPast
+    var lastPowerWriteAt = Date.distantPast
+    var didWarnThresholdOverlap = false
+    /// 平滑后的目标亮度，避免环境光跳变时亮度阶梯突变造成“闪烁”。
+    var smoothedBrightness: Double?
+    var ambientBrightSince: Date?
+    var ambientDarkSince: Date?
+}
+
+private var comboPolicyState = ComboPolicyState()
+
+/// Mac 侧空闲秒数（任意键鼠与触控板事件）。
+private func systemIdleSeconds() -> TimeInterval {
+    guard let anyEvent = CGEventType(rawValue: UInt32.max) else { return 0 }
+    return CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyEvent)
+}
+
+private func comboSetting(_ key: String, _ fallback: Int) -> Int {
+    return UserDefaults.standard.object(forKey: key) as? Int ?? fallback
+}
+
+/// 组合策略：入座/离座决定开关，环境光映射亮度，时段为主 + 环境微调决定色温。
+/// 只在「智能组合」开启时接管；熄屏同步与待机仍在其之前生效。
+private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
+    guard statusIndicator.isComboPolicyEnabled else { return }
+    guard displayID != nil, !isAsleep else {
+        statusIndicator.setComboStatus("组合策略 · 显示器未就绪")
+        return
+    }
+    if Date() < statusIndicator.comboManualOverrideUntil {
+        statusIndicator.setComboStatus("组合策略 · 手动设置保护中，暂不覆写")
+        return
+    }
+    if statusIndicator.isReadingModeEnabled {
+        statusIndicator.setComboStatus("组合策略 · 阅读模式优先，暂停自动调整")
+        return
+    }
+    if statusIndicator.isUserAdjustingLamp {
+        statusIndicator.setComboStatus("组合策略 · 正在手动调节，暂停自动调整")
+        return
+    }
+
+    let openThreshold = statusIndicator.ambientOpenThreshold
+    let closeThresholdValue = statusIndicator.ambientCloseThreshold
+    let ambient = displayAmbientProxy
+    let rawIdle = systemIdleSeconds()
+    // 系统在部分上下文会返回 NaN/负值；无效值按“刚有活动”处理，避免整条策略静默失效。
+    let idle = rawIdle.isFinite && rawIdle >= 0 ? rawIdle : 0
+    // 离座判定阈值：固件实测约 3 分钟才关灯，所以默认用 App 侧 90 秒兼底。
+    let idleLimit = TimeInterval(comboSetting("comboIdleSeconds", 600))
+    let macActive = idle < idleLimit
+    let now = Date()
+    // 等待首次状态回读，避免启动瞬间因电源状态未知而多写一次。
+    guard lamp.isPowerOn != nil else {
+        statusIndicator.setComboStatus("组合策略 · 等待灯体状态")
+        return
+    }
+    // 任何方向的电源写入都留 45 秒冷却，避免门限重叠或状态竞态时反复开关。
+    let powerWriteAllowed = now.timeIntervalSince(comboPolicyState.lastPowerWriteAt) >= 45
+    // 环境光阈值直接复用面板里的两个标定值（单位≈lux）。
+    // 灯体自动感光会持续覆写亮度，与策略引擎冲突，发现即关闭。
+    if lamp.isAutoLightEnabled == true {
+        _ = lamp.setAutoLight(enabled: false)
+        log("组合策略：已关闭灯体自动感光，改由策略按环境光映射亮度")
+    }
+
+    // === 优先级：入座 → 屏幕 → 环境光 ===
+    // 1) 入座最高优先级：在场以 Mac 键鼠活动为准（空闲超阈值即判离座）。
+    //    固件“有人入座”事件只给 120 秒到达宽限，不用作长期在场证据，
+    //    否则固件离座关灯后 App 会在 30 分钟内反复把灯又打开。
+    let present = macActive
+    let arrivalGrace = now.timeIntervalSince(lastPresenceEventAt) < 120
+    if !present {
+        if powerWriteAllowed, !arrivalGrace, lamp.isPowerOn == true,
+           now.timeIntervalSince(comboPolicyState.lastEnginePowerOffAt) > 30 {
+            if lamp.setPower(on: false) {
+                comboPolicyState.lastEnginePowerOffAt = now
+                comboPolicyState.lastPowerWriteAt = now
+                log("组合策略：无人（Mac 空闲 \(Int(idle / 60)) 分钟），已关闭 iScreenBar")
+            }
+        }
+        statusIndicator.setComboStatus("组合策略 · 无人（Mac 空闲 \(Int(idle / 60)) 分钟）")
+        return
+    }
+
+    // 2) 屏幕未唤醒：不点灯（引擎已在 isAsleep 时提前返回）。
+    let ambientOnThreshold = openThreshold ?? 400
+    let ambientOffThreshold = closeThresholdValue ?? 450
+
+    // 灯亮时读数包含灯自身贡献（实测 65% 时约 +670 lux ≈ 10 lux/%），
+    // 扣掉后才能得到“真实环境光”，否则灯一亮就会被判为环境充足而关灯（来回振荡）。
+    let lampLuxPerPercent = Double(comboSetting("lampLuxPerPercent", 1))
+    let lampContribution = lamp.isPowerOn == true
+        ? lampLuxPerPercent * Double(lamp.currentBrightness ?? 0)
+        : 0
+    let ambientOnly: Int? = ambient.map { max(0, Int((Double($0) - lampContribution).rounded())) }
+
+    // 3) 有人在座（入座检测常开，已检测到入座 event）+ 环境充足 → 关灯
+    if let ambientOnly, Double(ambientOnly) >= Double(ambientOffThreshold),
+       lamp.isPowerOn == true, powerWriteAllowed,
+       now.timeIntervalSince(lastPresenceEventAt) < 3600 {
+        if comboPolicyState.ambientBrightSince == nil { comboPolicyState.ambientBrightSince = now }
+        if let since = comboPolicyState.ambientBrightSince, now.timeIntervalSince(since) >= 30 {
+            if lamp.setPower(on: false) {
+                comboPolicyState.lastEnginePowerOffAt = now
+                comboPolicyState.lastPowerWriteAt = now
+                log("组合策略：环境 \(ambientOnly) lux ≥ 充足阈值 \(ambientOffThreshold)，持续 30 秒，已关闭 iScreenBar")
+            }
+            statusIndicator.setComboStatus("组合策略 · 环境充足，已关灯")
+            return
+        }
+    } else {
+        comboPolicyState.ambientBrightSince = nil
+    }
+
+    // 4) 有人 + 环境不足 → 点灯（持续 10 秒确认）
+    if lamp.isPowerOn != true {
+        if let ambient, Double(ambient) <= Double(ambientOnThreshold) {
+            if comboPolicyState.ambientDarkSince == nil { comboPolicyState.ambientDarkSince = now }
+            if let since = comboPolicyState.ambientDarkSince, now.timeIntervalSince(since) >= 10,
+               powerWriteAllowed, lamp.setPower(on: true) {
+                comboPolicyState.lastPowerWriteAt = now
+                comboPolicyState.lastEnginePowerOffAt = .distantPast
+                log("组合策略：环境 \(ambient) lux ≤ 不足阈值 \(ambientOnThreshold)，已开启 iScreenBar")
+            }
+        } else {
+            comboPolicyState.ambientDarkSince = nil
+        }
+        statusIndicator.setComboStatus("组合策略 · 在座，等待环境光判定")
+        return
+    }
+
+    // 3) 亮度：环境越暗灯越亮，在 [下限, 上限] 之间线性映射，再做平滑限速。
+    //    使用扣除灯贡献后的环境值，避免“灯变亮 → 读数变高 → 又调低”的反馈振荡。
+    guard lamp.isPowerOn == true, let ambientOnly else {
+        statusIndicator.setComboStatus(ambientOnly == nil ? "组合策略 · 等待环境光数据" : "组合策略 · 在座，等待开灯条件")
+        return
+    }
+    let brightnessCeiling = min(100, max(1, comboSetting("comboBrightnessMax", 75)))
+    let brightnessFloor = min(brightnessCeiling, max(1, comboSetting("comboBrightnessMin", 40)))
+    let mapDark = Double(comboSetting("comboMapDark", 150))
+    let mapBright = max(mapDark + 1, Double(comboSetting("comboMapBright", 450)))
+    let ratio = min(1, max(0, (Double(ambientOnly) - mapDark) / (mapBright - mapDark)))
+    let mapped = Double(brightnessCeiling) - Double(brightnessCeiling - brightnessFloor) * ratio
+
+    // 首次从灯体当前亮度起步，让接管过程是渐变而不是一下子跳过去。
+    let previous = comboPolicyState.smoothedBrightness
+        ?? Double(lamp.currentBrightness ?? Int(mapped.rounded()))
+    // 单次最多变化 10%，再乘 0.5 系数，避免环境光跳变时亮度阶跃。
+    let slewed = previous + max(-10, min(10, (mapped - previous) * 0.5))
+    comboPolicyState.smoothedBrightness = slewed
+    let appliedBrightness = max(1, min(100, Int(slewed.rounded())))
+    let currentBrightness = lamp.currentBrightness ?? appliedBrightness
+    if abs(appliedBrightness - currentBrightness) >= 3,
+       now.timeIntervalSince(comboPolicyState.lastBrightnessWriteAt) >= 4,
+       lamp.setBrightness(appliedBrightness) {
+        comboPolicyState.lastBrightness = appliedBrightness
+        comboPolicyState.lastBrightnessWriteAt = now
+        log("组合策略：环境（扣除灯贡献）\(ambientOnly) lux → 目标 \(Int(mapped.rounded()))%，平滑后亮度 \(appliedBrightness)%")
+    }
+
+    // 4) 色温：时段基线 ± 环境微调（暗更暖、亮更冷），单次最多 250K。
+    let baseline = statusIndicator.baselineTemperature(at: now)
+    let tweak = Int((Double(comboSetting("comboTemperatureTweakK", 400)) * (ratio * 2 - 1)).rounded())
+    let mappedTemperature = max(2700, min(6500, baseline + tweak))
+    let currentTemperature = lamp.currentTemperature ?? mappedTemperature
+    let temperatureStep = max(-250, min(250, mappedTemperature - currentTemperature))
+    let appliedTemperature = max(2700, min(6500, currentTemperature + temperatureStep))
+    if abs(appliedTemperature - currentTemperature) >= 100,
+       now.timeIntervalSince(comboPolicyState.lastTemperatureWriteAt) >= 30,
+       lamp.setTemperature(appliedTemperature) {
+        comboPolicyState.lastTemperature = appliedTemperature
+        comboPolicyState.lastTemperatureWriteAt = now
+        log("组合策略：时段基线 \(baseline)K 微调 \(tweak > 0 ? "+" : "")\(tweak)K → 色温 \(appliedTemperature)K")
+    }
+
+    let occupancyText = "在座·键鼠活动"
+    statusIndicator.setComboStatus("组合策略 · \(occupancyText) · 亮度 \(appliedBrightness)% · 色温 \(appliedTemperature)K")
+}
+
 private func pollDisplayAndLamp() {
     statusIndicator.applyModeForFrontmostAppIfNeeded()
     let consoleSessionLocked = isConsoleSessionLocked()
     if consoleSessionLocked != wasConsoleSessionLocked {
         if consoleSessionLocked {
-            log(requestSystemDisplaySleep()
-                ? "轮询检测到 Mac 已锁定，已请求系统立即熄屏"
-                : "轮询检测到 Mac 已锁定，但系统熄屏请求失败")
+            // 只在“没有刚发生过入座唤醒”且距上次强制熄屏超过 5 分钟时才执行，
+            // 否则会与入座唤醒形成 熄屏→唤醒→熄屏 的循环。
+            if Date().timeIntervalSince(lastPresenceWakeAt) > 120,
+               Date().timeIntervalSince(lastForcedDisplaySleepAt) > 300 {
+                lastForcedDisplaySleepAt = Date()
+                log(requestSystemDisplaySleep()
+                    ? "轮询检测到 Mac 已锁定，已请求系统立即熄屏"
+                    : "轮询检测到 Mac 已锁定，但系统熄屏请求失败")
+            } else {
+                log("检测到 Mac 已锁定（刚唤醒过，跳过强制熄屏）")
+            }
         } else {
             log("检测到 Mac 已解锁")
         }
@@ -2699,17 +3629,28 @@ private func pollDisplayAndLamp() {
         if let displayID {
             wasAsleep = CGDisplayIsAsleep(displayID) != 0
             log("检测到 Studio Display 已连接：ID=\(displayID)，分辨率=\(CGDisplayPixelsWide(displayID))x\(CGDisplayPixelsHigh(displayID))")
+            // 待机期间因未连接而关闭的灯，重新连接后恢复（屏幕已熄时交给熄屏同步处理）。
+            if helperTurnedLampOff, !wasAsleep, statusIndicator.isPowerSyncEnabled, lamp.setPower(on: true) {
+                helperTurnedLampOff = false
+                log("Studio Display 已重新连接，已恢复 iScreenBar 电源")
+            }
+            if !wasAsleep { statusIndicator.restorePresenceAfterScreenWake() }
         } else {
             wasAsleep = false
             log("Studio Display 已断开，程序继续驻留等待重连")
         }
         statusIndicator.handleStudioDisplayConnection(connected: displayID != nil)
     }
+    statusIndicator.setStudioDisplayAvailable(displayID != nil)
+    statusIndicator.syncPresenceSettingsIfNeeded()
     let isAsleep = displayID.map { CGDisplayIsAsleep($0) != 0 } ?? false
     let brightnessFollowEnabled = statusIndicator.isBrightnessFollowEnabled
     let displayBrightnessLockEnabled = statusIndicator.isDisplayBrightnessLockEnabled
     let powerSyncEnabled = statusIndicator.isPowerSyncEnabled
+    // 熄屏时是否保留入座检测、允许“入座→唤醒屏幕”（默认开启：有人入座通常就是要用显示器）。
+    let presenceWakesDisplay = comboSetting("presenceWakesDisplay", 1) == 1
     let ambientLinkEnabled = statusIndicator.isAmbientLinkEnabled
+    let comboEnabled = statusIndicator.isComboPolicyEnabled
     let ambientCloseThreshold = statusIndicator.ambientCloseThreshold
     let rawAmbientSource = (value: studioAmbientSensor.rawIlluminance(), name: "Studio Display 光线传感器")
     if ambientProxySourceName != rawAmbientSource.name {
@@ -2725,24 +3666,77 @@ private func pollDisplayAndLamp() {
     let sampleCutoff = sampleTime.addingTimeInterval(-10)
     ambientProxySamples.removeAll { $0.0 < sampleCutoff }
     let sortedAmbientValues = ambientProxySamples.map { $0.1 }.sorted()
-    let displayAmbientProxy = sortedAmbientValues.isEmpty ? nil : sortedAmbientValues[sortedAmbientValues.count / 2]
+    // 传感器位于屏幕正面，读数低于桌面水平照度；按实测比例（542/317≈1.71）折算为桌面估算照度。
+    let ambientScale = Double(comboSetting("ambientScalePercent", 208)) / 100.0
+    let displayAmbientProxy = sortedAmbientValues.isEmpty
+        ? nil
+        : Int((Double(sortedAmbientValues[sortedAmbientValues.count / 2]) * ambientScale).rounded())
     if let displayAmbientProxy, lastLoggedAmbientProxy != displayAmbientProxy {
         log("环境响应分数：\(displayAmbientProxy)（\(rawAmbientSource.name)，10 秒中位数）")
         lastLoggedAmbientProxy = displayAmbientProxy
     }
     statusIndicator.updateDisplayAmbientProxy(displayAmbientProxy, sourceName: rawAmbientSource.name)
 
+    // 待机（未连接 Studio Display）等同于熄屏：显示器拔线或断电时也要关闭 iScreenBar，
+    // 否则灯会一直亮着；重新连接时在连接事件里恢复。
+    if powerSyncEnabled, displayID == nil {
+        statusIndicator.suspendPresenceForScreenSleep()
+        if lamp.isPowerOn == true, lamp.setPower(on: false) {
+            helperTurnedLampOff = true
+            log("未连接 Studio Display，熄屏同步已关闭 iScreenBar")
+        }
+    }
+
+    // 固件自行点亮灯 = 检测到有人入座：记为入座事件（最多 3 分钟内有效），供唤醒与占用判定使用。
+    if let power = lamp.isPowerOn {
+        if lastKnownLampPower == false, power == true,
+           Date().timeIntervalSince(comboPolicyState.lastPowerWriteAt) > 3 {
+            lastPresenceEventAt = Date()
+            log("灯体自行点亮：视为检测到入座")
+        }
+        lastKnownLampPower = power
+    }
+
+    // 动态管理灯体入座检测：只在“需要它自动点灯”时开启，避免与环境充足关灯互相拉扯。
+    // 入座检测：改为固件常开（优先级最高）。是否有人、何时离座全部交给灯体毫米波传感器，
+    // 不再用 Mac 键鼠空闲判离座（看视频不动键鼠会被误判为离座）。
+    if Date().timeIntervalSince(lastPresenceToggleAt) >= 30 {
+        if statusIndicator.updateFirmwarePresence(requested: true) {
+            lastPresenceToggleAt = Date()
+        }
+    }
+
     // 熄屏同步是最高优先级：屏幕熄灭期间，环境光、入座检测或灯体自身逻辑
     // 都不得重新点亮灯。持续检测可覆盖灯体在熄屏后中途自行亮起的情况。
     if powerSyncEnabled, isAsleep {
-        statusIndicator.suspendPresenceForScreenSleep()
-        if lamp.isPowerOn == true {
-            let turnedOff = lamp.setPower(on: false)
-            helperTurnedLampOff = helperTurnedLampOff || turnedOff
-            if turnedOff {
-                log("熄屏同步优先级已压制灯体自动重新点亮")
+        if presenceWakesDisplay, lamp.isPresenceDetectionEnabled == true {
+            // 保留入座检测：固件因“有人坐下”把灯点亮时，视为人回来了，直接唤醒屏幕并保留灯光。
+            // 但要求 Mac 近期有操作，否则整夜无人时也会被固件误检点亮并唤醒屏幕。
+            if lamp.isPowerOn == true {
+                let macIdle = systemIdleSeconds()
+                // 只在“最近 2 小时内用过电脑”时接受入座唤醒，避免整夜无人时被误检叫醒屏幕。
+                if macIdle < 7200, Date().timeIntervalSince(lastPresenceWakeAt) > 30 {
+                    lastPresenceWakeAt = Date()
+                    helperTurnedLampOff = false
+                    let woke = requestSystemDisplayWake()
+                    log(woke ? "检测到入座：灯体已点亮，已唤醒显示器" : "检测到入座：但唤醒显示器请求失败")
+                } else if macIdle >= 7200 {
+                    if lamp.setPower(on: false) {
+                        helperTurnedLampOff = true
+                        log("忽略入座信号：Mac 已空闲 \(Int(macIdle / 60)) 分钟，判为固件误检，已关灯")
+                    }
+                }
             }
-            statusIndicator.update(isAsleep: true, healthy: turnedOff)
+        } else {
+            statusIndicator.suspendPresenceForScreenSleep()
+            if lamp.isPowerOn == true {
+                let turnedOff = lamp.setPower(on: false)
+                helperTurnedLampOff = helperTurnedLampOff || turnedOff
+                if turnedOff {
+                    log("熄屏同步优先级已压制灯体自动重新点亮")
+                }
+                statusIndicator.update(isAsleep: true, healthy: turnedOff)
+            }
         }
     }
 
@@ -2767,7 +3761,7 @@ private func pollDisplayAndLamp() {
         wasAmbientLinkEnabled = ambientLinkEnabled
     }
 
-    if ambientLinkEnabled, !isAsleep, let displayAmbientProxy {
+    if ambientLinkEnabled, !comboEnabled, !isAsleep, let displayAmbientProxy {
         if ambientTurnedLampOff {
             statusIndicator.maintainPresenceSuspendedForAmbientLock()
             ambientCloseCandidateSince = nil
@@ -2907,9 +3901,15 @@ private func pollDisplayAndLamp() {
         if isAsleep {
             log("检测到 Studio Display 熄屏")
             if powerSyncEnabled {
-                statusIndicator.suspendPresenceForScreenSleep()
-                helperTurnedLampOff = lamp.setPower(on: false)
-                statusIndicator.update(isAsleep: true, healthy: helperTurnedLampOff)
+                if presenceWakesDisplay, lamp.isPresenceDetectionEnabled == true {
+                    log("熄屏同步：保留入座检测，以便入座时唤醒显示器")
+                    helperTurnedLampOff = lamp.setPower(on: false)
+                    statusIndicator.update(isAsleep: true, healthy: helperTurnedLampOff)
+                } else {
+                    statusIndicator.suspendPresenceForScreenSleep()
+                    helperTurnedLampOff = lamp.setPower(on: false)
+                    statusIndicator.update(isAsleep: true, healthy: helperTurnedLampOff)
+                }
             } else {
                 statusIndicator.update(isAsleep: true, healthy: true)
             }
@@ -2928,7 +3928,13 @@ private func pollDisplayAndLamp() {
         wasAsleep = isAsleep
     }
 
-    statusIndicator.applyScheduledTemperatureIfNeeded(isAsleep: isAsleep)
+    // 待机（未连接 Studio Display）时不写灯体设置。
+    if !comboEnabled, displayID != nil {
+        statusIndicator.applyScheduledTemperatureIfNeeded(isAsleep: isAsleep, force: false)
+    }
+
+    // 组合策略在熄屏/唤醒切换处理完之后接管，避免与熄屏同步抢写。
+    runComboPolicy(isAsleep: isAsleep, displayAmbientProxy: displayAmbientProxy)
 
     if displayBrightnessLockEnabled,
        !isAsleep,
@@ -2976,7 +3982,7 @@ private func pollDisplayAndLamp() {
         lastStudioDisplayBrightnessForLock = nil
     }
 
-    if brightnessFollowEnabled, !isAsleep, let displayID,
+    if brightnessFollowEnabled, !comboEnabled, !isAsleep, let displayID,
        let displayBrightness = displayBrightnessReader.percent(for: displayID) {
         if let anchorRevision = anchorStatusRevision,
            lamp.statusRevision > anchorRevision,
