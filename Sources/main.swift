@@ -1147,7 +1147,7 @@ private final class StatusIndicator: NSObject {
         if isComboPolicyEnabled {
             let close = ambientCloseThreshold.map(String.init) ?? "--"
             let open = ambientOpenThreshold.map(String.init) ?? "--"
-            ambientStatusLabel.stringValue = "\(currentText) lux  ·  ≤\(open) 补光 / ≥\(close) 关灯  ·  健康目标 300–500 lux（桌面）"
+            ambientStatusLabel.stringValue = "\(currentText) lux（环境估算，已扣除灯光） ·  ≤\(open) 补光 / ≥\(close) 关灯  ·  健康目标 300–500 lux"
         } else if let close = ambientCloseThreshold, let open = ambientOpenThreshold, open >= close {
             ambientStatusLabel.stringValue = "\(currentText)  ·  阈值重叠，可能反复开关"
         } else if !areAmbientRulesEnabled, ambientCloseThreshold != nil || ambientOpenThreshold != nil {
@@ -3485,17 +3485,25 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     }
 
     // 2) 有人但屏幕未唤醒：默认不点灯（引擎已在 isAsleep 时提前返回）。
-    let ambientOffThreshold = closeThreshold ?? 220
-    let ambientOnThreshold = openThreshold ?? 150
+    let ambientOffThreshold = closeThreshold ?? 650
+    let ambientOnThreshold = openThreshold ?? 400
 
-    // 3) 有人 + 屏幕在用 + 环境充足 → 关灯（持续 30 秒）
-    if let ambient, Double(ambient) >= Double(ambientOffThreshold), lamp.isPowerOn == true, powerWriteAllowed {
+    // 灯亮时读数包含灯自身贡献（实测 65% 时约 +670 lux ≈ 10 lux/%），
+    // 扣掉后才能得到“真实环境光”，否则灯一亮就会被判为环境充足而关灯（来回振荡）。
+    let lampLuxPerPercent = Double(comboSetting("lampLuxPerPercent", 1))
+    let lampContribution = lamp.isPowerOn == true
+        ? lampLuxPerPercent * Double(lamp.currentBrightness ?? 0)
+        : 0
+    let ambientOnly: Int? = ambient.map { max(0, Int((Double($0) - lampContribution).rounded())) }
+
+    // 3) 有人 + 屏幕在用 + 环境（扣除灯贡献）充足 → 关灯（持续 30 秒）
+    if let ambientOnly, Double(ambientOnly) >= Double(ambientOffThreshold), lamp.isPowerOn == true, powerWriteAllowed {
         if comboPolicyState.ambientBrightSince == nil { comboPolicyState.ambientBrightSince = now }
         if let since = comboPolicyState.ambientBrightSince, now.timeIntervalSince(since) >= 30 {
             if lamp.setPower(on: false) {
                 comboPolicyState.lastEnginePowerOffAt = now
                 comboPolicyState.lastPowerWriteAt = now
-                log("组合策略：环境 \(ambient) lux ≥ 充足阈值 \(ambientOffThreshold)，持续 30 秒，已关闭 iScreenBar")
+                log("组合策略：环境（扣除灯贡献）\(ambientOnly) lux ≥ 充足阈值 \(ambientOffThreshold)，持续 30 秒，已关闭 iScreenBar")
             }
             statusIndicator.setComboStatus("组合策略 · 环境充足，已关灯")
             return
@@ -3521,17 +3529,17 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
         return
     }
 
-    guard lamp.isPowerOn == true, let ambient else {
-        statusIndicator.setComboStatus(ambient == nil ? "组合策略 · 等待环境光数据" : "组合策略 · 在座，等待开灯条件")
+    // 3) 亮度：环境越暗灯越亮，在 [下限, 上限] 之间线性映射，再做平滑限速。
+    //    使用扣除灯贡献后的环境值，避免“灯变亮 → 读数变高 → 又调低”的反馈振荡。
+    guard lamp.isPowerOn == true, let ambientOnly else {
+        statusIndicator.setComboStatus(ambientOnly == nil ? "组合策略 · 等待环境光数据" : "组合策略 · 在座，等待开灯条件")
         return
     }
-
-    // 3) 亮度：环境越暗灯越亮，在 [下限, 上限] 之间线性映射，再做平滑限速。
     let brightnessCeiling = min(100, max(1, comboSetting("comboBrightnessMax", 75)))
     let brightnessFloor = min(brightnessCeiling, max(1, comboSetting("comboBrightnessMin", 40)))
-    let mapDark = Double(comboSetting("comboMapDark", 100))
-    let mapBright = max(mapDark + 1, Double(comboSetting("comboMapBright", 550)))
-    let ratio = min(1, max(0, (Double(ambient) - mapDark) / (mapBright - mapDark)))
+    let mapDark = Double(comboSetting("comboMapDark", 150))
+    let mapBright = max(mapDark + 1, Double(comboSetting("comboMapBright", 500)))
+    let ratio = min(1, max(0, (Double(ambientOnly) - mapDark) / (mapBright - mapDark)))
     let mapped = Double(brightnessCeiling) - Double(brightnessCeiling - brightnessFloor) * ratio
 
     // 首次从灯体当前亮度起步，让接管过程是渐变而不是一下子跳过去。
@@ -3547,7 +3555,7 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
        lamp.setBrightness(appliedBrightness) {
         comboPolicyState.lastBrightness = appliedBrightness
         comboPolicyState.lastBrightnessWriteAt = now
-        log("组合策略：环境分数 \(ambient) → 目标 \(Int(mapped.rounded()))%，平滑后亮度 \(appliedBrightness)%")
+        log("组合策略：环境（扣除灯贡献）\(ambientOnly) lux → 目标 \(Int(mapped.rounded()))%，平滑后亮度 \(appliedBrightness)%")
     }
 
     // 4) 色温：时段基线 ± 环境微调（暗更暖、亮更冷），单次最多 250K。
@@ -3638,7 +3646,11 @@ private func pollDisplayAndLamp() {
     let sampleCutoff = sampleTime.addingTimeInterval(-10)
     ambientProxySamples.removeAll { $0.0 < sampleCutoff }
     let sortedAmbientValues = ambientProxySamples.map { $0.1 }.sorted()
-    let displayAmbientProxy = sortedAmbientValues.isEmpty ? nil : sortedAmbientValues[sortedAmbientValues.count / 2]
+    // 传感器位于屏幕正面，读数低于桌面水平照度；按实测比例（542/317≈1.71）折算为桌面估算照度。
+    let ambientScale = Double(comboSetting("ambientScalePercent", 208)) / 100.0
+    let displayAmbientProxy = sortedAmbientValues.isEmpty
+        ? nil
+        : Int((Double(sortedAmbientValues[sortedAmbientValues.count / 2]) * ambientScale).rounded())
     if let displayAmbientProxy, lastLoggedAmbientProxy != displayAmbientProxy {
         log("环境响应分数：\(displayAmbientProxy)（\(rawAmbientSource.name)，10 秒中位数）")
         lastLoggedAmbientProxy = displayAmbientProxy
