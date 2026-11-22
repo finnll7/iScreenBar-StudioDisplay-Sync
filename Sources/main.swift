@@ -1147,7 +1147,7 @@ private final class StatusIndicator: NSObject {
         if isComboPolicyEnabled {
             let close = ambientCloseThreshold.map(String.init) ?? "--"
             let open = ambientOpenThreshold.map(String.init) ?? "--"
-            ambientStatusLabel.stringValue = "\(currentText)  ·  组合模式：≥\(close) 关灯 / ≤\(open) 开灯"
+            ambientStatusLabel.stringValue = "\(currentText) lux  ·  ≥\(close) 关灯 / ≤\(open) 开灯  ·  办公参考 300–500 lux"
         } else if let close = ambientCloseThreshold, let open = ambientOpenThreshold, open >= close {
             ambientStatusLabel.stringValue = "\(currentText)  ·  阈值重叠，可能反复开关"
         } else if !areAmbientRulesEnabled, ambientCloseThreshold != nil || ambientOpenThreshold != nil {
@@ -3529,8 +3529,8 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     // 3) 亮度：环境越暗灯越亮，在 [下限, 上限] 之间线性映射，再做平滑限速。
     let brightnessCeiling = min(100, max(1, comboSetting("comboBrightnessMax", 75)))
     let brightnessFloor = min(brightnessCeiling, max(1, comboSetting("comboBrightnessMin", 40)))
-    let mapDark = Double(comboSetting("comboMapDark", 20))
-    let mapBright = max(mapDark + 1, Double(comboSetting("comboMapBright", 250)))
+    let mapDark = Double(comboSetting("comboMapDark", 100))
+    let mapBright = max(mapDark + 1, Double(comboSetting("comboMapBright", 800)))
     let ratio = min(1, max(0, (Double(ambient) - mapDark) / (mapBright - mapDark)))
     let mapped = Double(brightnessCeiling) - Double(brightnessCeiling - brightnessFloor) * ratio
 
