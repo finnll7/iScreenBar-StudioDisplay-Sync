@@ -7,15 +7,17 @@
     <key>CFBundleIdentifier</key>
     <string>local.qiu.iScreenBarStudioSync</string>
     <key>CFBundleName</key>
-    <string>iScreen Menu</string>
+    <string>iScreenBar</string>
     <key>CFBundleDisplayName</key>
-    <string>iScreen Menu</string>
+    <string>iScreenBar</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.2.0</string>
+    <string>0.8.1</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>33</string>
     <key>LSUIElement</key>
     <true/>
 </dict>

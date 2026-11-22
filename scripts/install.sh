@@ -6,8 +6,10 @@ project_dir=${script_dir:h}
 account_name=$(id -un)
 account_uid=$(id -u)
 user_home_dir=$(dscl . -read "/Users/$account_name" NFSHomeDirectory | awk '{print $2}')
-source_app="$project_dir/build/iScreen Menu.app"
-installed_app="$user_home_dir/Applications/iScreen Menu.app"
+source_app="$project_dir/build/iScreenBar.app"
+# 默认装到用户级目录；传 INSTALL_DIR=/Applications 可装进系统应用目录（自动判断是否需要 sudo）。
+install_dir="${INSTALL_DIR:-$user_home_dir/Applications}"
+installed_app="$install_dir/iScreenBar.app"
 launch_agents_dir="$user_home_dir/Library/LaunchAgents"
 launch_agent="$launch_agents_dir/local.qiu.iScreenBarStudioSync.plist"
 logs_dir="$user_home_dir/Library/Logs"
@@ -17,8 +19,47 @@ label="local.qiu.iScreenBarStudioSync"
 "$script_dir/build.sh"
 
 launchctl bootout "gui/$account_uid/$label" 2>/dev/null || true
-mkdir -p "$user_home_dir/Applications" "$launch_agents_dir" "$logs_dir"
-ditto "$source_app" "$installed_app"
+# 等旧进程完全退出，否则新实例会被单实例保护判定为重复运行而直接退出。
+for _ in {1..60}; do
+  pgrep -f iScreenBarStudioSync >/dev/null || break
+  sleep 0.1
+done
+# bootout 可能留下孤儿进程，它们会独占 HID 并让新实例退出。
+pkill -f "Contents/MacOS/iScreenBarStudioSync" 2>/dev/null || true
+sleep 0.5
+mkdir -p "$launch_agents_dir" "$logs_dir"
+if [[ ! -d "$install_dir" ]]; then
+  if [[ "$install_dir" == /Applications ]]; then
+    sudo mkdir -p "$install_dir"
+  else
+    mkdir -p "$install_dir"
+  fi
+fi
+for legacy_app in "$install_dir/iScreen Menu.app" "$install_dir/iScreenBar Menu.app"; do
+if [[ -d "$legacy_app" ]]; then
+  if [[ -w "$install_dir" ]]; then rm -rf "$legacy_app"; else sudo rm -rf "$legacy_app"; fi
+  echo "已删除旧名称副本：$legacy_app"
+fi
+done
+# 安全保护：目标位置若是明基官方 iScreenBar.app（bundle id 不同），绝不覆盖
+if [[ -d "$installed_app" ]]; then
+  existing_id=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$installed_app/Contents/Info.plist" 2>/dev/null || true)
+  if [[ -n "$existing_id" && "$existing_id" != "$label" ]]; then
+    echo "目标位置已有其他应用（$existing_id），已中止以免覆盖；请改用 INSTALL_DIR 指定其他目录。" >&2
+    exit 1
+  fi
+fi
+# 目标已存在但属主不是当前用户时，先清掉再复制
+if [[ -d "$installed_app" && ! -w "$installed_app" ]]; then
+  sudo rm -rf "$installed_app"
+fi
+if [[ -w "$install_dir" ]]; then
+  ditto "$source_app" "$installed_app"
+else
+  echo "目标目录需要管理员权限，正在用 sudo 复制到 $install_dir ?"
+  sudo ditto "$source_app" "$installed_app"
+  sudo chown -R "$account_name":staff "$installed_app"
+fi
 
 escaped_executable=${installed_app//&/&amp;}
 escaped_log=${log_file//&/&amp;}
@@ -32,7 +73,8 @@ escaped_log=${log_file//&/&amp;}
   print "<string>$escaped_executable/Contents/MacOS/iScreenBarStudioSync</string>"
   print '</array>'
   print '<key>RunAtLoad</key><true/>'
-  print '<key>KeepAlive</key><true/>'
+  print '<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>'
+  print '<key>ThrottleInterval</key><integer>10</integer>'
   print "<key>StandardOutPath</key><string>$escaped_log</string>"
   print "<key>StandardErrorPath</key><string>$escaped_log</string>"
   print '</dict></plist>'
@@ -41,5 +83,5 @@ escaped_log=${log_file//&/&amp;}
 plutil -lint "$launch_agent"
 launchctl bootstrap "gui/$account_uid" "$launch_agent"
 
-echo "iScreen Menu 已安装并启动，请从菜单栏打开。"
+echo "iScreenBar 已安装并启动，请从菜单栏打开。"
 echo "Log: $log_file"

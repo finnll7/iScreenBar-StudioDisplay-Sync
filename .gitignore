@@ -5,3 +5,7 @@ backups/
 iScreenBarStudioSync
 *.log
 .swiftpm/
+
+# 防止把构建产物/应用包提交进仓库
+*.app/
+*.app
