@@ -3459,7 +3459,6 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
         return
     }
 
-    let closeThreshold = statusIndicator.ambientCloseThreshold
     let openThreshold = statusIndicator.ambientOpenThreshold
     let ambient = displayAmbientProxy
     let rawIdle = systemIdleSeconds()
@@ -3502,8 +3501,7 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
         return
     }
 
-    // 2) 有人但屏幕未唤醒：默认不点灯（引擎已在 isAsleep 时提前返回）。
-    let ambientOffThreshold = closeThreshold ?? 650
+    // 2) 屏幕未唤醒：不点灯（引擎已在 isAsleep 时提前返回）。
     let ambientOnThreshold = openThreshold ?? 400
 
     // 灯亮时读数包含灯自身贡献（实测 65% 时约 +670 lux ≈ 10 lux/%），
@@ -3514,21 +3512,8 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
         : 0
     let ambientOnly: Int? = ambient.map { max(0, Int((Double($0) - lampContribution).rounded())) }
 
-    // 3) 有人 + 屏幕在用 + 环境（扣除灯贡献）充足 → 关灯（持续 30 秒）
-    if let ambientOnly, Double(ambientOnly) >= Double(ambientOffThreshold), lamp.isPowerOn == true, powerWriteAllowed {
-        if comboPolicyState.ambientBrightSince == nil { comboPolicyState.ambientBrightSince = now }
-        if let since = comboPolicyState.ambientBrightSince, now.timeIntervalSince(since) >= 30 {
-            if lamp.setPower(on: false) {
-                comboPolicyState.lastEnginePowerOffAt = now
-                comboPolicyState.lastPowerWriteAt = now
-                log("组合策略：环境（扣除灯贡献）\(ambientOnly) lux ≥ 充足阈值 \(ambientOffThreshold)，持续 30 秒，已关闭 iScreenBar")
-            }
-            statusIndicator.setComboStatus("组合策略 · 环境充足，已关灯")
-            return
-        }
-    } else {
-        comboPolicyState.ambientBrightSince = nil
-    }
+    // 3) 环境充足时不强制关灯：固件已判定有人并点亮灯，App 再去关会形成开关拉扯。
+    //    无人时固件会自己关（离座约 3 分钟），App 只负责“环境不足时补开”的保底责任。
 
     // 4) 有人 + 环境不足 → 点灯（持续 10 秒确认）
     if lamp.isPowerOn != true {
@@ -3556,7 +3541,7 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     let brightnessCeiling = min(100, max(1, comboSetting("comboBrightnessMax", 75)))
     let brightnessFloor = min(brightnessCeiling, max(1, comboSetting("comboBrightnessMin", 40)))
     let mapDark = Double(comboSetting("comboMapDark", 150))
-    let mapBright = max(mapDark + 1, Double(comboSetting("comboMapBright", 500)))
+    let mapBright = max(mapDark + 1, Double(comboSetting("comboMapBright", 450)))
     let ratio = min(1, max(0, (Double(ambientOnly) - mapDark) / (mapBright - mapDark)))
     let mapped = Double(brightnessCeiling) - Double(brightnessCeiling - brightnessFloor) * ratio
 
@@ -3696,27 +3681,10 @@ private func pollDisplayAndLamp() {
     }
 
     // 动态管理灯体入座检测：只在“需要它自动点灯”时开启，避免与环境充足关灯互相拉扯。
-    // 入座检测按需启停：带回差（不足阈值开、充足阈值关）+ 5 秒去抖 + 30 秒冷却，
-    // 避免在阈值附近每 250ms 来回切换（曾出现一分钟 28 次）。
-    let closeThresholdForPresence = statusIndicator.ambientCloseThreshold ?? 500
-    let openThresholdForPresence = statusIndicator.ambientOpenThreshold ?? 300
-    let ambientForPresence = displayAmbientProxy ?? 0
-    var presenceDesire: Bool?
-    if isAsleep {
-        presenceDesire = true
-    } else if ambientForPresence <= openThresholdForPresence {
-        presenceDesire = true
-    } else if ambientForPresence >= closeThresholdForPresence {
-        presenceDesire = false
-    }
-    if let presenceDesire {
-        if presenceDesire != lastPresenceDesire {
-            lastPresenceDesire = presenceDesire
-            presenceDesireSince = Date()
-        }
-        if Date().timeIntervalSince(presenceDesireSince) >= 5,
-           Date().timeIntervalSince(lastPresenceToggleAt) >= 30,
-           statusIndicator.updateFirmwarePresence(requested: presenceDesire) {
+    // 入座检测：改为固件常开（优先级最高）。是否有人、何时离座全部交给灯体毫米波传感器，
+    // 不再用 Mac 键鼠空闲判离座（看视频不动键鼠会被误判为离座）。
+    if Date().timeIntervalSince(lastPresenceToggleAt) >= 30 {
+        if statusIndicator.updateFirmwarePresence(requested: true) {
             lastPresenceToggleAt = Date()
         }
     }
