@@ -3695,7 +3695,10 @@ private func pollDisplayAndLamp() {
 
     // 待机（未连接 Studio Display）等同于熄屏：显示器拔线或断电时也要关闭 iScreenBar，
     // 否则灯会一直亮着；重新连接时在连接事件里恢复。
-    if powerSyncEnabled, displayID == nil {
+    // 灯的 USB 与 Studio Display 同在雷雳链路：拔线后 HID 设备随之消失，但
+    // isPowerOn/isPresenceDetectionEnabled 仍是断开前的缓存值。isConnected=false
+    // 时跳过写入，避免整个断开期间每 250ms 刷一轮“重连失败”日志。
+    if powerSyncEnabled, displayID == nil, lamp.isConnected {
         statusIndicator.suspendPresenceForScreenSleep()
         if lamp.isPowerOn == true, lamp.setPower(on: false) {
             helperTurnedLampOff = true
@@ -3741,15 +3744,13 @@ private func pollDisplayAndLamp() {
                     presenceWakeNoResponse = 0
                     presenceWakePausedUntil = .distantPast
                 }
-                if macIdle >= 7200 {
-                    if lamp.setPower(on: false) {
-                        helperTurnedLampOff = true
-                        log("忽略入座信号：Mac 已空闲 \(Int(macIdle / 60)) 分钟，判为固件误检，已关灯")
-                    }
-                } else if Date().timeIntervalSince(lastPresenceWakeAt) > 30,
-                          Date() >= presenceWakePausedUntil {
-                    // 只在“最近 2 小时内用过电脑”且不在误检冷却期时接受入座唤醒，
-                    // 避免整夜无人时被固件误检叫醒屏幕、或误检期间反复亮屏。
+                if Date().timeIntervalSince(lastPresenceWakeAt) > 30,
+                   Date() >= presenceWakePausedUntil {
+                    // 不再用“Mac 空闲超 2 小时”判固件误检并关灯：整夜离开后的回座
+                    // 是真实场景，会被误杀成“灯亮一下又被 App 熄灭、摸键盘才恢复”
+                    // （实测：空闲 412 分钟一回座灯即被关）。误检由“连续 2 次唤醒
+                    // 无人响应键鼠 → 暂停 15 分钟”约束；灯的开关交给固件的
+                    // 入座/离座判定（离座 180 秒自行熄灭）。
                     lastPresenceWakeAt = Date()
                     helperTurnedLampOff = false
                     let woke = requestSystemDisplayWake()
