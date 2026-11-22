@@ -3655,11 +3655,20 @@ private func pollDisplayAndLamp() {
     if powerSyncEnabled, isAsleep {
         if presenceWakesDisplay, lamp.isPresenceDetectionEnabled == true {
             // 保留入座检测：固件因“有人坐下”把灯点亮时，视为人回来了，直接唤醒屏幕并保留灯光。
-            if lamp.isPowerOn == true, Date().timeIntervalSince(lastPresenceWakeAt) > 30 {
-                lastPresenceWakeAt = Date()
-                helperTurnedLampOff = false
-                let woke = requestSystemDisplayWake()
-                log(woke ? "检测到入座：灯体已点亮，已唤醒显示器" : "检测到入座：但唤醒显示器请求失败")
+            // 但要求 Mac 近期有操作，否则整夜无人时也会被固件误检点亮并唤醒屏幕。
+            if lamp.isPowerOn == true {
+                let macIdle = systemIdleSeconds()
+                if macIdle < 300, Date().timeIntervalSince(lastPresenceWakeAt) > 30 {
+                    lastPresenceWakeAt = Date()
+                    helperTurnedLampOff = false
+                    let woke = requestSystemDisplayWake()
+                    log(woke ? "检测到入座：灯体已点亮，已唤醒显示器" : "检测到入座：但唤醒显示器请求失败")
+                } else if macIdle >= 300 {
+                    if lamp.setPower(on: false) {
+                        helperTurnedLampOff = true
+                        log("忽略入座信号：Mac 已空闲 \(Int(macIdle / 60)) 分钟，判为固件误检，已关灯")
+                    }
+                }
             }
         } else {
             statusIndicator.suspendPresenceForScreenSleep()
