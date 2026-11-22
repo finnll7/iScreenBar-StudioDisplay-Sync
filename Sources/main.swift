@@ -1937,6 +1937,10 @@ private final class StatusIndicator: NSObject {
             // 只在确认会话已锁定时请求系统立即熄屏，不影响解锁后的显示配置。
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                 guard isConsoleSessionLocked() else { return }
+                // 刚发生过入座唤醒时不要立刻又熄屏，否则会形成循环。
+                guard Date().timeIntervalSince(lastPresenceWakeAt) > 120,
+                      Date().timeIntervalSince(lastForcedDisplaySleepAt) > 300 else { return }
+                lastForcedDisplaySleepAt = Date()
                 log(requestSystemDisplaySleep()
                     ? "检测到 Mac 已锁定，已请求系统立即熄屏"
                     : "检测到 Mac 已锁定，但系统熄屏请求失败")
@@ -3342,6 +3346,8 @@ var lastPresenceWakeAt = Date.distantPast
 var lastKnownLampPower: Bool?
 /// 最近一次“固件报告有人入座”的时间，短时间内视为有人在座。
 var lastPresenceEventAt = Date.distantPast
+/// 上次强制系统熄屏的时间，用于限速，避免与人座唤醒形成循环。
+var lastForcedDisplaySleepAt = Date.distantPast
 var ambientTurnedLampOff = UserDefaults.standard.bool(forKey: "ambientLampLockActive")
 var ambientCloseCandidateSince: Date?
 var ambientOpenCandidateSince: Date?
@@ -3568,9 +3574,17 @@ private func pollDisplayAndLamp() {
     let consoleSessionLocked = isConsoleSessionLocked()
     if consoleSessionLocked != wasConsoleSessionLocked {
         if consoleSessionLocked {
-            log(requestSystemDisplaySleep()
-                ? "轮询检测到 Mac 已锁定，已请求系统立即熄屏"
-                : "轮询检测到 Mac 已锁定，但系统熄屏请求失败")
+            // 只在“没有刚发生过入座唤醒”且距上次强制熄屏超过 5 分钟时才执行，
+            // 否则会与入座唤醒形成 熄屏→唤醒→熄屏 的循环。
+            if Date().timeIntervalSince(lastPresenceWakeAt) > 120,
+               Date().timeIntervalSince(lastForcedDisplaySleepAt) > 300 {
+                lastForcedDisplaySleepAt = Date()
+                log(requestSystemDisplaySleep()
+                    ? "轮询检测到 Mac 已锁定，已请求系统立即熄屏"
+                    : "轮询检测到 Mac 已锁定，但系统熄屏请求失败")
+            } else {
+                log("检测到 Mac 已锁定（刚唤醒过，跳过强制熄屏）")
+            }
         } else {
             log("检测到 Mac 已解锁")
         }
@@ -3655,7 +3669,7 @@ private func pollDisplayAndLamp() {
     let ambientEnoughForLamp = displayAmbientProxy.flatMap { value in
         statusIndicator.ambientCloseThreshold.map { value >= $0 }
     } ?? false
-    let wantFirmwarePresence = isAsleep || !ambientEnoughForLamp || lamp.isPowerOn == true
+    let wantFirmwarePresence = isAsleep || !ambientEnoughForLamp
     statusIndicator.updateFirmwarePresence(requested: wantFirmwarePresence)
 
     // 熄屏同步是最高优先级：屏幕熄灭期间，环境光、入座检测或灯体自身逻辑
