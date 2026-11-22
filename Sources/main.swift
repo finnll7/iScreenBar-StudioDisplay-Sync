@@ -79,7 +79,10 @@ private func requestSystemDisplaySleep() -> Bool {
 private func requestSystemDisplayWake() -> Bool {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
-    process.arguments = ["-u", "-t", "2"]
+    // -u 只在断言存续期内阻止熄屏。实测 -t 2 的断言一过期，powerd 会因
+    // “距上次键鼠活动过久”立即重新变暗并熄屏（屏幕只亮约 12 秒），
+    // 刚入座还没碰到键盘的人就会遇到“解锁→又锁屏”。给 90 秒落座缓冲。
+    process.arguments = ["-u", "-t", "90"]
     process.standardOutput = FileHandle.nullDevice
     process.standardError = FileHandle.nullDevice
     do {
@@ -2989,6 +2992,7 @@ private final class LampController {
     func setPower(on: Bool) -> Bool {
         if sendPowerReport(on: on) {
             isPowerOn = on
+            lastLampPowerCommandAt = Date()
             log("灯已\(on ? "开启" : "关闭")")
             return true
         }
@@ -3000,6 +3004,7 @@ private final class LampController {
         }
 
         isPowerOn = on
+        lastLampPowerCommandAt = Date()
         log("重连成功，灯已\(on ? "开启" : "关闭")")
         return true
     }
@@ -3340,6 +3345,9 @@ private func isConsoleSessionLocked() -> Bool {
 }
 
 var displayID = studioDisplayID()
+/// App 自身最后一次下发电源指令的时间：3 秒内的电源变化都算自身写入的回显，
+/// 不判为固件“自行点亮/熄灭”（否则熄屏同步关灯会被误判成离座、补开又被误判成入座）。
+var lastLampPowerCommandAt = Date.distantPast
 private let lamp = LampController()
 private let displayBrightnessReader = DisplayBrightnessReader()
 private let studioAmbientSensor = StudioDisplayAmbientSensor()
@@ -3354,6 +3362,10 @@ var wasConsoleSessionLocked = isConsoleSessionLocked()
 var helperTurnedLampOff = false
 /// 入座唤醒显示器的限速时间戳，避免固件反复点亮时不断发唤醒。
 var lastPresenceWakeAt = Date.distantPast
+/// 入座唤醒后一直无人碰键鼠的连续次数；满 2 次判为固件误检。
+var presenceWakeNoResponse = 0
+/// 入座唤醒的冷却截止时间：误检暂停期内不再自动点亮显示器。
+var presenceWakePausedUntil = Date.distantPast
 /// 上一次观察到的灯体电源状态，用于识别“固件自行点亮”这种入座事件。
 var lastKnownLampPower: Bool?
 /// 最近一次“固件报告有人入座”的时间，短时间内视为有人在座。
@@ -3692,8 +3704,9 @@ private func pollDisplayAndLamp() {
     }
 
     // 固件自行点亮/熄灭：前者=检测到入座，后者=判定离座（此时 App 不应“补开”）。
+    // lastLampPowerCommandAt 在 setPower 里统一打标，覆盖熄屏同步、组合策略等全部写入路径。
     if let power = lamp.isPowerOn {
-        let externalChange = Date().timeIntervalSince(comboPolicyState.lastPowerWriteAt) > 3
+        let externalChange = Date().timeIntervalSince(lastLampPowerCommandAt) > 3
         if lastKnownLampPower == false, power == true, externalChange {
             lastPresenceEventAt = Date()
             log("灯体自行点亮：视为检测到入座")
@@ -3720,18 +3733,27 @@ private func pollDisplayAndLamp() {
             // 保留入座检测：固件因“有人坐下”把灯点亮时，视为人回来了，直接唤醒屏幕并保留灯光。
             // 但要求 Mac 近期有操作，否则整夜无人时也会被固件误检点亮并唤醒屏幕。
             if lamp.isPowerOn == true {
-                let macIdle = systemIdleSeconds()
-                // 只在“最近 2 小时内用过电脑”时接受入座唤醒，避免整夜无人时被误检叫醒屏幕。
-                if macIdle < 7200, Date().timeIntervalSince(lastPresenceWakeAt) > 30 {
-                    lastPresenceWakeAt = Date()
-                    helperTurnedLampOff = false
-                    let woke = requestSystemDisplayWake()
-                    log(woke ? "检测到入座：灯体已点亮，已唤醒显示器" : "检测到入座：但唤醒显示器请求失败")
-                } else if macIdle >= 7200 {
+                let rawIdle = systemIdleSeconds()
+                // 系统偶发返回 NaN/负值，按“刚有活动”处理，与组合策略口径一致。
+                let macIdle = rawIdle.isFinite && rawIdle >= 0 ? rawIdle : 0
+                // 真实键鼠活动立即清掉误检冷却：有人正在用电脑。
+                if macIdle < 5 {
+                    presenceWakeNoResponse = 0
+                    presenceWakePausedUntil = .distantPast
+                }
+                if macIdle >= 7200 {
                     if lamp.setPower(on: false) {
                         helperTurnedLampOff = true
                         log("忽略入座信号：Mac 已空闲 \(Int(macIdle / 60)) 分钟，判为固件误检，已关灯")
                     }
+                } else if Date().timeIntervalSince(lastPresenceWakeAt) > 30,
+                          Date() >= presenceWakePausedUntil {
+                    // 只在“最近 2 小时内用过电脑”且不在误检冷却期时接受入座唤醒，
+                    // 避免整夜无人时被固件误检叫醒屏幕、或误检期间反复亮屏。
+                    lastPresenceWakeAt = Date()
+                    helperTurnedLampOff = false
+                    let woke = requestSystemDisplayWake()
+                    log(woke ? "检测到入座：灯体已点亮，已唤醒显示器" : "检测到入座：但唤醒显示器请求失败")
                 }
             }
         } else {
@@ -3907,6 +3929,20 @@ private func pollDisplayAndLamp() {
     if isAsleep != wasAsleep {
         if isAsleep {
             log("检测到 Studio Display 熄屏")
+            // 评估上一次入座唤醒是否得到键鼠响应：最后一次键鼠时间不晚于唤醒发起时间，
+            // 说明亮屏期间没人碰过电脑（典型固件误检）；连续 2 次即暂停入座唤醒 15 分钟。
+            let rawIdleNow = systemIdleSeconds()
+            if rawIdleNow.isFinite, rawIdleNow >= 0,
+               Date().addingTimeInterval(-rawIdleNow) <= lastPresenceWakeAt {
+                presenceWakeNoResponse += 1
+                if presenceWakeNoResponse >= 2 {
+                    presenceWakeNoResponse = 0
+                    presenceWakePausedUntil = Date().addingTimeInterval(900)
+                    log("入座唤醒连续 2 次无人响应，15 分钟内暂停入座唤醒")
+                }
+            } else {
+                presenceWakeNoResponse = 0
+            }
             if powerSyncEnabled {
                 if presenceWakesDisplay, lamp.isPresenceDetectionEnabled == true {
                     log("熄屏同步：保留入座检测，以便入座时唤醒显示器")
