@@ -277,7 +277,7 @@ struct GlassPanelView: View {
             }
             Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 8) {
                 GridRow {
-                    Text("明亮关灯")
+                    Text("环境充足")
                         .font(.system(size: 11.5))
                         .frame(width: 62, alignment: .leading)
                     TextField("--", text: $closeText)
@@ -291,7 +291,7 @@ struct GlassPanelView: View {
                         .disabled(!snapshot.captureEnabled)
                 }
                 GridRow {
-                    Text("昏暗开灯")
+                    Text("环境不足")
                         .font(.system(size: 11.5))
                         .frame(width: 62, alignment: .leading)
                     TextField("--", text: $openText)
