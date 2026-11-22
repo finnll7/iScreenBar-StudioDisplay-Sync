@@ -3484,11 +3484,13 @@ private func runComboPolicy(isAsleep: Bool, displayAmbientProxy: Int?) {
     }
 
     // === 优先级：入座 → 屏幕 → 环境光 ===
-    // 1) 入座最高优先级：有人 = 近期键鼠活动 或 灯体刚报告“有人入座”（3 分钟内有效）。
-    let presenceRecent = now.timeIntervalSince(lastPresenceEventAt) < 1800
-    let present = macActive || presenceRecent
+    // 1) 入座最高优先级：在场以 Mac 键鼠活动为准（空闲超阈值即判离座）。
+    //    固件“有人入座”事件只给 120 秒到达宽限，不用作长期在场证据，
+    //    否则固件离座关灯后 App 会在 30 分钟内反复把灯又打开。
+    let present = macActive
+    let arrivalGrace = now.timeIntervalSince(lastPresenceEventAt) < 120
     if !present {
-        if powerWriteAllowed, lamp.isPowerOn == true,
+        if powerWriteAllowed, !arrivalGrace, lamp.isPowerOn == true,
            now.timeIntervalSince(comboPolicyState.lastEnginePowerOffAt) > 30 {
             if lamp.setPower(on: false) {
                 comboPolicyState.lastEnginePowerOffAt = now
