@@ -732,6 +732,8 @@ private final class StatusIndicator: NSObject {
     private var areAmbientRulesEnabled: Bool
     private var isDisplayAutoPresetEnabled: Bool
     private var didSyncPresenceSettings = false
+    /// 入座检测是否被策略临时停用（面板需要提示，避免看起来像故障）。
+    private(set) var isPresenceSuspendedByPolicy = false
     private let panelModel = PanelModel()
     private var glassHostController: NSViewController?
     private var isHealthy = true
@@ -1513,14 +1515,18 @@ private final class StatusIndicator: NSObject {
 
     /// 组合模式用：根据当前是否“需要灯体自己点灯”来启用/停用入座检测，
     /// 避免固件的自动开灯与“环境充足关灯”互相拆台。
-    func updateFirmwarePresence(requested: Bool) {
-        guard didSyncPresenceSettings, lamp.isConnected else { return }
-        guard lamp.isPresenceDetectionEnabled != requested else { return }
-        if setFirmwarePresenceEnabled(requested) {
+    @discardableResult
+    func updateFirmwarePresence(requested: Bool) -> Bool {
+        guard didSyncPresenceSettings, lamp.isConnected else { return false }
+        guard lamp.isPresenceDetectionEnabled != requested else { return false }
+        let success = setFirmwarePresenceEnabled(requested)
+        if success {
+            isPresenceSuspendedByPolicy = !requested
             log(requested
                 ? "已启用灯体入座检测（需要它感知入座/自动点灯）"
-                : "已停用灯体入座检测（无需自动点灯，改用键鼠活动判定）")
+                : "已停用灯体入座检测（环境充足，改用键鼠活动判定）")
         }
+        return success
     }
 
     /// 组合模式用：临时启用/停用灯体入座检测（无人时避免固件误触发点灯）。
@@ -2598,9 +2604,15 @@ private final class StatusIndicator: NSObject {
                 ? "原设置已开启；关灯锁定期间临时暂停，解除后自动恢复"
                 : "关灯锁定期间不可开启入座检测"
         } else {
-            presenceSwitch.title = "入座检测"
-            presenceSwitch.state = lamp.isPresenceDetectionEnabled == true ? .on : .off
-            presenceSwitch.toolTip = "开启或关闭灯体入座检测"
+            if isPresenceSuspendedByPolicy, lamp.isPresenceDetectionEnabled != true {
+                presenceSwitch.title = "入座检测·暂停"
+                presenceSwitch.state = .off
+                presenceSwitch.toolTip = "环境光已充足，策略临时停用灯体入座检测避免自动点灯；屏幕休眠时会自动恢复"
+            } else {
+                presenceSwitch.title = "入座检测"
+                presenceSwitch.state = lamp.isPresenceDetectionEnabled == true ? .on : .off
+                presenceSwitch.toolTip = "开启或关闭灯体入座检测"
+            }
         }
         videoModeSwitch.state = lamp.isVideoModeEnabled == true ? .on : .off
         brightnessFollowSwitch.state = isBrightnessFollowEnabled ? .on : .off
@@ -3346,6 +3358,10 @@ var lastPresenceWakeAt = Date.distantPast
 var lastKnownLampPower: Bool?
 /// 最近一次“固件报告有人入座”的时间，短时间内视为有人在座。
 var lastPresenceEventAt = Date.distantPast
+/// 入座检测启停去抖：期望状态、变更时间与上次下发时间。
+var lastPresenceDesire: Bool?
+var presenceDesireSince = Date()
+var lastPresenceToggleAt = Date.distantPast
 /// 上次强制系统熄屏的时间，用于限速，避免与人座唤醒形成循环。
 var lastForcedDisplaySleepAt = Date.distantPast
 var ambientTurnedLampOff = UserDefaults.standard.bool(forKey: "ambientLampLockActive")
@@ -3678,11 +3694,30 @@ private func pollDisplayAndLamp() {
     }
 
     // 动态管理灯体入座检测：只在“需要它自动点灯”时开启，避免与环境充足关灯互相拉扯。
-    let ambientEnoughForLamp = displayAmbientProxy.flatMap { value in
-        statusIndicator.ambientCloseThreshold.map { value >= $0 }
-    } ?? false
-    let wantFirmwarePresence = isAsleep || !ambientEnoughForLamp
-    statusIndicator.updateFirmwarePresence(requested: wantFirmwarePresence)
+    // 入座检测按需启停：带回差（不足阈值开、充足阈值关）+ 5 秒去抖 + 30 秒冷却，
+    // 避免在阈值附近每 250ms 来回切换（曾出现一分钟 28 次）。
+    let closeThresholdForPresence = statusIndicator.ambientCloseThreshold ?? 500
+    let openThresholdForPresence = statusIndicator.ambientOpenThreshold ?? 300
+    let ambientForPresence = displayAmbientProxy ?? 0
+    var presenceDesire: Bool?
+    if isAsleep {
+        presenceDesire = true
+    } else if ambientForPresence <= openThresholdForPresence {
+        presenceDesire = true
+    } else if ambientForPresence >= closeThresholdForPresence {
+        presenceDesire = false
+    }
+    if let presenceDesire {
+        if presenceDesire != lastPresenceDesire {
+            lastPresenceDesire = presenceDesire
+            presenceDesireSince = Date()
+        }
+        if Date().timeIntervalSince(presenceDesireSince) >= 5,
+           Date().timeIntervalSince(lastPresenceToggleAt) >= 30,
+           statusIndicator.updateFirmwarePresence(requested: presenceDesire) {
+            lastPresenceToggleAt = Date()
+        }
+    }
 
     // 熄屏同步是最高优先级：屏幕熄灭期间，环境光、入座检测或灯体自身逻辑
     // 都不得重新点亮灯。持续检测可覆盖灯体在熄屏后中途自行亮起的情况。
