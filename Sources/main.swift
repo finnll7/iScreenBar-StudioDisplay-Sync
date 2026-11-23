@@ -775,6 +775,42 @@ private final class StatusIndicator: NSObject {
         set { UserDefaults.standard.set(newValue, forKey: "builtinManuallyDisabled") }
     }
 
+    /// 断开外屏时的「内屏救急」：临时打开内屏并把用户原本的内屏偏好存档，
+    /// 一旦有任意外接屏在线（重连 Studio Display 或接入其他显示器）就收起
+    /// 内屏、恢复原偏好；救急不再直接覆写用户的「内屏关闭」设置。
+    private var builtinRescueActive: Bool {
+        get { UserDefaults.standard.bool(forKey: "builtinRescueActive") }
+        set { UserDefaults.standard.set(newValue, forKey: "builtinRescueActive") }
+    }
+    private var builtinManuallyDisabledBeforeRescue: Bool? {
+        get { UserDefaults.standard.object(forKey: "builtinManuallyDisabledBeforeRescue") as? Bool }
+        set { UserDefaults.standard.set(newValue, forKey: "builtinManuallyDisabledBeforeRescue") }
+    }
+    private var lastBuiltinRescueResolveAt = Date.distantPast
+
+    private func beginBuiltinRescue() {
+        if !builtinRescueActive {
+            builtinRescueActive = true
+            builtinManuallyDisabledBeforeRescue = isBuiltinManuallyDisabled
+        }
+        isBuiltinManuallyDisabled = false
+    }
+
+    /// 轮询驱动：救急期间出现任意在线外接屏时收尾。disableBuiltin 在显示切换
+    /// 瞬间可能失败，限速 2 秒后靠轮询重试。
+    func resolveBuiltinRescueIfNeeded() {
+        guard builtinRescueActive,
+              Date().timeIntervalSince(lastBuiltinRescueResolveAt) > 2,
+              !displayController.externalDisplays().isEmpty else { return }
+        lastBuiltinRescueResolveAt = Date()
+        guard displayController.disableBuiltin() else { return }
+        isBuiltinManuallyDisabled = builtinManuallyDisabledBeforeRescue ?? isBuiltinManuallyDisabled
+        builtinManuallyDisabledBeforeRescue = nil
+        builtinRescueActive = false
+        refreshControls()
+        log("检测到外接显示器在线，已收起内屏并恢复原内屏设置（外接独占）")
+    }
+
     init(isAsleep: Bool, lamp: LampController) {
         self.lamp = lamp
         self.isAsleep = isAsleep
@@ -1914,6 +1950,9 @@ private final class StatusIndicator: NSObject {
         let success = requested ? displayController.enableBuiltin() : displayController.disableBuiltin()
         if success {
             isBuiltinManuallyDisabled = !requested
+            // 用户手动切换内屏：救急状态作废，以用户当前选择为准。
+            builtinRescueActive = false
+            builtinManuallyDisabledBeforeRescue = nil
         } else {
             displayPowerSwitch.state = requested ? .off : .on
         }
@@ -1988,17 +2027,21 @@ private final class StatusIndicator: NSObject {
             if !connected {
                 // 外屏断开后内屏是唯一的退路：即使显示会话正在切换或锁定，
                 // 也先恢复内屏在线，避免“不安全”保护把断开事件直接丢掉。
-                self.isBuiltinManuallyDisabled = false
-                let enabled = self.displayController.enableBuiltin()
-                if enabled {
-                    self.requestBuiltinWakeAfterExternalDisconnect()
-                    if self.isDisplaySessionSafe, !isConsoleSessionLocked() {
-                        _ = self.displayController.restoreBuiltinDefault()
+                // 已有其他外接屏在线或盒盖时不救急：前者桌面已由外接屏承载，
+                // 后者无人观看，让系统自然睡眠即可。
+                if self.displayController.externalDisplays().isEmpty, !self.displayController.lidClosed() {
+                    self.beginBuiltinRescue()
+                    let enabled = self.displayController.enableBuiltin()
+                    if enabled {
+                        self.requestBuiltinWakeAfterExternalDisconnect()
+                        if self.isDisplaySessionSafe, !isConsoleSessionLocked() {
+                            _ = self.displayController.restoreBuiltinDefault()
+                        }
+                    } else {
+                        self.pendingDisplayConnectionState = false
+                        self.scheduleDisplaySessionActivation()
+                        log("外接显示器已断开，内屏恢复未生效，已安排重试")
                     }
-                } else {
-                    self.pendingDisplayConnectionState = false
-                    self.scheduleDisplaySessionActivation()
-                    log("外接显示器已断开，内屏恢复未生效，已安排重试")
                 }
                 self.refreshControls()
                 return
@@ -2033,7 +2076,10 @@ private final class StatusIndicator: NSObject {
         for (index, delay) in delays.enumerated() {
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self, studioDisplayID() == nil else { return }
-                self.isBuiltinManuallyDisabled = false
+                // 已有其他外接屏在线或盒盖时不再救急（后续重试项会持续自检）。
+                guard self.displayController.externalDisplays().isEmpty,
+                      !self.displayController.lidClosed() else { return }
+                self.beginBuiltinRescue()
                 let enabled = self.displayController.enableBuiltin(force: true)
                 let lidOpen = !self.displayController.lidClosed()
                 let wakeRequested = lidOpen && requestSystemDisplayWake()
@@ -2189,9 +2235,15 @@ private final class StatusIndicator: NSObject {
         }
         if !connected {
             // 不等待 5 秒的会话稳定期；先尝试打开内屏，后续再恢复旋转和主屏。
-            isBuiltinManuallyDisabled = false
-            requestBuiltinWakeAfterExternalDisconnect()
-            log("检测到外屏断开，已安排强制启用内屏和独立重试")
+            // 已有其他外接屏在线或盒盖时不救急：前者桌面已由外接屏承载（保持
+            // 内屏原状），后者无人观看，系统自然睡眠即可。
+            if displayController.externalDisplays().isEmpty, !displayController.lidClosed() {
+                beginBuiltinRescue()
+                requestBuiltinWakeAfterExternalDisconnect()
+                log("检测到外屏断开，已安排强制启用内屏和独立重试")
+            } else {
+                log("检测到外屏断开，已有其他外接屏在线或盒盖，内屏维持原状")
+            }
         }
         guard isDisplaySessionSafe else { return }
         pendingDisplayConnectionState = nil
@@ -3657,6 +3709,9 @@ private func pollDisplayAndLamp() {
         }
         statusIndicator.handleStudioDisplayConnection(connected: displayID != nil)
     }
+    // 断外屏「内屏救急」的收尾：一旦有任意外接屏在线（重连的 Studio Display
+    // 或公司的 ThinkVision 等），收起内屏并恢复用户原本的内屏偏好。
+    statusIndicator.resolveBuiltinRescueIfNeeded()
     statusIndicator.setStudioDisplayAvailable(displayID != nil)
     statusIndicator.syncPresenceSettingsIfNeeded()
     let isAsleep = displayID.map { CGDisplayIsAsleep($0) != 0 } ?? false
@@ -4061,6 +4116,9 @@ private func pollDisplayAndLamp() {
                         _ = lamp.setPower(on: true)
                     }
                 }
+                // 断链时被暂停的入座检测：显示唤醒路径的恢复可能先于 HID 重连
+                // 而失败，这里在 HID 恢复后补一次（幂等，已恢复过则无动作）。
+                if !isAsleep { statusIndicator.restorePresenceAfterScreenWake() }
                 if brightnessFollowEnabled {
                     brightnessOffset = nil
                     lastDisplayBrightness = nil
